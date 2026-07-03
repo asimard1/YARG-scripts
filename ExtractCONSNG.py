@@ -1,0 +1,1308 @@
+# --- Startup: single-thread C libs BEFORE numpy/librosa/scipy initialize ---
+import os
+os.environ.update({
+    "OMP_NUM_THREADS":        "1",
+    "OPENBLAS_NUM_THREADS":   "1",
+    "MKL_NUM_THREADS":        "1",
+    "VECLIB_MAXIMUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS":    "1",
+})
+
+try:
+    import subprocess
+    import io
+    import argparse
+    import re
+    import struct
+    import sys
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    from pathlib import Path
+    import shutil
+    from PIL import Image
+    import texture2ddecoder
+
+    import numpy as np
+    import soundfile as sf
+except ImportError as e:
+    pkg = str(e).split("'")[-2] if "'" in str(e) else "required dependencies"
+    print(f"Error: Could not import {pkg}.")
+    print("-" * 40)
+    print("Please install the required libraries by running:")
+    print("pip install librosa numpy soundfile scipy")
+    print("-" * 40)
+    sys.exit(1)
+
+
+# --- Constants ---
+
+# Delay search
+MAX_DELAY_MS = 100     # initial search range (ms)
+COARSE_STEP = 3        # coarse scan spacing before fine refinement
+FINE_STEP = 1          # fine scan spacing
+EXTEND_LIMIT = 5       # can extend to ±(EXTEND_LIMIT × MAX_DELAY_MS)
+TOLERANCE_MS = 15      # onset match window (ms) — overridden by --tolerance
+SOFT_SCORE_POWER = 2   # parameter to control the shape of the soft score curve
+HOP_LENGTH = 512       # librosa hop length for onset detection — overridden by --hop-length
+BOUNDARY_BONUS = False # whether to apply extra weight to first/last 5% of chart notes
+BOUNDARY_PCT = 0.05    # fraction of notes at each end that receive the boundary bonus
+STREAK_BONUS = False   # whether to apply a multiplier to notes that are isolated
+STREAK_BASE = 5.0     # the base of the sigmoid used (\frac{1-a^{-x}}{1+a^{-x}})
+
+# Audio - lowpass emphasizes kick/bass onsets; HPSS isolates percussive transients
+LOWPASS_HZ = 200     # lowpass cutoff
+SR = 22050           # target sample rate
+AUDIO_CLIP_S = 1800  # max seconds of audio to read (None = unlimited)
+
+# Display / runtime
+MAX_SONG_NAME = 40
+LIST_PATH = Path(__file__).parent / "yarg_sync_list.json"
+WORKER_THREADS = 6
+ETA_EMA_ALPHA = 0.1
+
+# File format magic bytes
+CON_MAGIC = b"CON "
+SNG_MAGIC = b"SNGPKG"
+STEM_CANDIDATES = [
+    "bass", "drums", "drum", "drums_1", "drums_2", "drums_3", "drums_4",
+    "rhythm", "guitar", "keys", "vocals", "backing", "song", "ssong",
+    "channel-01", "channel-02", "channel-03", "channel-04", "band"
+]
+STEM_IGNORE = ["preview", "crowd"]
+EXTENSION_LIST = [".ogg", ".opus", ".mp3", ".wav"]
+
+# STFS block geometry
+_STFS_BLOCK = 0x1000
+_STFS_BASE = 0xC000   # data area start; block 0 is always at 0xC000
+
+# Thresholds
+TOTAL_PCT_MIN = 0.1  # overridden to 0.2 in hard-score mode
+
+
+# --- Terminal color ---
+
+def _setup_color() -> bool:
+    if os.name == "nt":
+        import ctypes
+        try:
+            k = ctypes.windll.kernel32
+            h = k.GetStdHandle(-11)
+            m = ctypes.c_ulong()
+            k.GetConsoleMode(h, ctypes.byref(m))
+            k.SetConsoleMode(h, m.value | 0x0004)
+            return True
+        except Exception:
+            return False
+    return sys.stdout.isatty()
+
+
+_COLOR = _setup_color()
+
+
+def _c(code: str, text: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if _COLOR else text
+
+
+def green(t):  return _c("32", t)
+def yellow(t): return _c("33", t)
+def red(t):    return _c("31", t)
+def bold(t):   return _c("1",  t)
+def dim(t):    return _c("2",  t)
+def cyan(t):   return _c("36", t)
+
+
+def dprint(debug: bool, msg: str, always_print: bool = False) -> None:
+    """Print msg always if always_print, or prefixed with [debug] when debug is on."""
+    if always_print:
+        print(msg)
+    elif debug:
+        print(f"      [debug] {msg}")
+
+
+# --- File & library scanning ---
+
+def _check_magic(path: Path, magic: bytes) -> bool:
+    try:
+        with path.open("rb") as f:
+            return f.read(len(magic)) == magic
+    except Exception:
+        return False
+
+
+def is_con_file(path: Path) -> bool: return _check_magic(path, CON_MAGIC)
+def is_sng_file(path: Path) -> bool: return _check_magic(path, SNG_MAGIC)
+
+
+def is_extracted_path(p: Path) -> bool:
+    return any(part.endswith("_extracted") for part in p.parts)
+
+
+def get_song_list(
+    root: Path,
+    skip_extracted: bool = False,
+) -> tuple[list[Path], int, int, int, list, list, list]:
+
+    cons = sorted(
+        p for p in root.rglob("*")
+        if p.is_file() and is_con_file(p)
+    )
+    sngs = sorted(root.rglob("*.sng"))
+
+    # Always exclude _extracted INIs whose parent CON/SNG is present
+    # — pre_extract_all handles those, they'll be added back via extracted_map
+    excluded_dirs = {Path(str(p) + "_extracted") for p in cons} | \
+                    {Path(str(p) + "_extracted") for p in sngs}
+
+    inis = sorted(
+        p for p in root.rglob("song.ini")
+        if not (skip_extracted and is_extracted_path(p))
+        and p.parent not in excluded_dirs
+    )
+
+    songs: list[Path] = sorted(inis + cons + sngs)
+    return songs, len(inis), len(cons), len(sngs), inis, cons, sngs
+
+
+# --- STFS / CON container parsing (Xbox 360 packages) ---
+
+def _stfs_block_offset(block: int, table_size_shift: int) -> int:
+    """Convert logical block number to byte offset. table_size_shift=1 for CON (two hash tables per 170-block group)."""
+    adjust = 0
+    if block >= 0xAA:
+        adjust += (block // 0xAA + 1) << table_size_shift
+    if block >= 0x70E4:
+        adjust += (block // 0x70E4 + 1) << table_size_shift
+    return _STFS_BASE + (block + adjust) * _STFS_BLOCK
+
+
+STFS_CHAIN_END = {0xFFFFFF, 0xFFFFFE}  # 0x000000 is NOT a sentinel
+
+
+def _stfs_next_block(data: bytes, block: int, table_size_shift: int) -> int:
+    group = block // 0xAA
+    index = block % 0xAA
+    hash_off = _stfs_block_offset(group * 0xAB, table_size_shift)
+    entry_off = hash_off + index * 0x18
+    if entry_off + 0x18 > len(data):
+        return 0xFFFFFF
+    next_block = int.from_bytes(data[entry_off + 0x15:entry_off + 0x18], "little")
+    return next_block if next_block not in STFS_CHAIN_END else 0xFFFFFF
+
+
+def _stfs_read_file(data: bytes, first_block: int, file_size: int,
+                    table_size_shift: int, is_contiguous: bool = False,
+                    debug: bool = False) -> bytes:
+    if file_size == 0:
+        print("File size is zero")
+        return b""
+
+    out = bytearray()
+    remaining = file_size
+    block = first_block
+    seen: set[int] = set()
+    guard = file_size // _STFS_BLOCK + 16
+
+    while remaining > 0 and guard > 0:
+        if block in seen:
+            dprint(debug, f"SEEN BLOCK {block}")
+            break
+        seen.add(block)
+        off = _stfs_block_offset(block, table_size_shift)
+        take = min(remaining, _STFS_BLOCK)
+        if off < 0 or off >= len(data):
+            dprint(debug, f"BAD OFFSET: block={block} off={off} len(data)={len(data)}")
+            break
+        out.extend(data[off:off + take])
+        remaining -= take
+        guard -= 1
+        if is_contiguous:
+            block += 1
+            continue
+        nb = _stfs_next_block(data, block, table_size_shift)
+        if nb == 0xFFFFFF:
+            break
+        block = nb
+
+    if guard <= 0 and debug:
+        print("GUARD EXPIRED")
+    return bytes(out)
+
+
+def _stfs_utf16be(data: bytes, offset: int, max_chars: int) -> str:
+    chars = []
+    for i in range(max_chars):
+        cp = struct.unpack(">H", data[offset + i*2:offset + i*2 + 2])[0]
+        if cp == 0:
+            break
+        chars.append(chr(cp))
+    return "".join(chars)
+
+
+def _stfs_parse_header(data: bytes, debug: bool) -> dict:
+    if data[:4] not in (b"CON ", b"LIVE", b"PIRS"):
+        raise ValueError("Not an STFS package")
+    info: dict = {}
+    try:
+        info["display_name"] = _stfs_utf16be(data, 0x0411, 64).strip()
+    except Exception:
+        info["display_name"] = ""
+    try:
+        # table_size_shift: 1 if ((EntryID + 0xFFF) & 0xF000) >> 0xC == 0xB else 0
+        # We force it to 0 (matches observed CON behaviour)
+        info["table_size_shift"] = 0
+        dprint(debug, "[FORCED] table_size_shift = 0")
+        vd_base = 0x037A
+        info["ftbl_count"] = struct.unpack("<H", data[vd_base + 0x02:vd_base + 0x04])[0]
+        info["ftbl_start"] = int.from_bytes(data[vd_base + 0x04:vd_base + 0x07], "big")
+    except Exception as exc:
+        raise ValueError(f"Cannot parse STFS volume descriptor: {exc}")
+    return info
+
+
+def _stfs_list_files(data: bytes, info: dict, debug: bool = False) -> list[dict]:
+    tss = info["table_size_shift"]
+    entries = []
+    seen: set[tuple] = set()
+
+    for i in range(info["ftbl_count"]):
+        blk_off = _stfs_block_offset(info["ftbl_start"] + i, tss)
+        if blk_off < 0 or blk_off + _STFS_BLOCK > len(data):
+            break
+        blk = data[blk_off:blk_off + _STFS_BLOCK]
+
+        for j in range(64):
+            e = blk[j * 0x40:(j + 1) * 0x40]
+            if len(e) < 0x40:
+                break
+            flags = e[0x28]
+            if flags == 0:
+                continue
+            n_len = flags & 0x3F
+            if n_len == 0 or n_len > 40:
+                continue
+            raw_name = e[:n_len]
+            if any(b < 0x20 or b > 0x7E for b in raw_name):
+                continue
+            try:
+                name = raw_name.decode("ascii")
+            except UnicodeDecodeError:
+                continue
+            first = int.from_bytes(e[0x2F:0x32], "little")
+            size = struct.unpack(">I", e[0x34:0x38])[0]
+            if first > 0xFFFFFF or size == 0 or size > len(data):
+                continue
+            lower = name.lower()
+            if "." not in lower:
+                continue
+            key = (lower, first, size)
+            if key in seen:
+                continue
+            seen.add(key)
+            alloc_blocks = int.from_bytes(e[0x29:0x2C], "little")
+            entries.append({
+                "name":          name,
+                "is_dir":        bool(flags & 0x80),
+                "first_blk":     first,
+                "size":          size,
+                "is_contiguous": bool(flags & 0x40),
+                "alloc_blocks":  alloc_blocks,
+            })
+    return entries
+
+
+# --- CON file kind classification and MOGG audio extraction ---
+
+# Maps file extensions to routing kind for extraction/metadata handlers.
+
+
+def _stfs_fallback_scan(data: bytes, debug: bool) -> tuple[bytes | None, bytes | None]:
+    """Raw byte scan for MThd/OggS when the STFS file table fails."""
+    mid_bytes = mogg_bytes = None
+
+    mid_pos = data.find(b"MThd")
+    if mid_pos >= 0:
+        try:
+            p = mid_pos
+            _, hlen = struct.unpack(">4sI", data[p:p + 8])
+            _, ntracks, _ = struct.unpack(">HHH", data[p + 8:p + 14])
+            end = p + 8 + hlen
+            for _ in range(ntracks):
+                if data[end:end + 4] != b"MTrk":
+                    break
+                tlen = struct.unpack(">I", data[end + 4:end + 8])[0]
+                end += 8 + tlen
+            mid_bytes = data[mid_pos:]
+        except Exception:
+            pass
+
+    ogg_pos = data.find(b"OggS")
+    dprint(debug, f"raw OggS search returned {ogg_pos}")
+    if ogg_pos >= 0:
+        mogg_bytes = data[ogg_pos:]
+
+    return mid_bytes, mogg_bytes
+
+
+# --- CON file kind classification ---
+
+_CON_FILE_KINDS = {
+    (".mid",):             "mid",
+    (".mogg", ".ogg"):     "mogg",
+    (".png", ".png_xbox"): "art_png",
+    (".jpg", ".jpeg"):     "art_jpg",
+    (".dta",):             "dta",
+    (".bin",):             "bin",
+    (".milo_xbox",):       "milo",
+    (".xvocab",):          "xvocab",
+    (".voc",):             "voc",
+    (".vnn",):             "vnn",
+}
+
+# Known-unused extensions — suppress "kind is none" warnings for these.
+
+
+_CON_KNOWN_IGNORED = {".usr"}
+
+
+def _classify_con_entry(name: str) -> str | None:
+    nl = name.lower()
+    for exts, kind in _CON_FILE_KINDS.items():
+        if any(nl.endswith(e) for e in exts):
+            return kind
+    return None
+
+
+# --- DTA metadata parsing (Rock Band songs.dta) ---
+
+def _tokenize_dta(text: str):
+    """Tokenize a Rock Band DTA S-expression: strip ; comments, return quoted strings, parens, and atoms."""
+    text = re.sub(r";[^\r\n]*", "", text)
+    return re.findall(r'"[^"]*"|\(|\)|[^\s()]+', text)
+
+
+def _parse_dta_tree(tokens):
+    """Parse DTA tokens into a nested list structure."""
+    def parse_expr():
+        if not tokens:
+            return None
+        token = tokens.pop(0)
+        if token == "(":
+            result = []
+            while tokens and tokens[0] != ")":
+                child = parse_expr()
+                if child is not None:
+                    result.append(child)
+            if tokens and tokens[0] == ")":
+                tokens.pop(0)
+            return result
+        return None if token == ")" else token
+
+    roots = []
+    while tokens:
+        expr = parse_expr()
+        if expr is not None:
+            roots.append(expr)
+    return roots
+
+
+def _parse_songs_dta(text: str) -> dict:
+    """Parse Rock Band songs.dta (Lisp-like S-expressions) into a Python dict.
+    Handles simple scalars (artist "Foo") and nested structures (tracks (drum (0 1)) ..).
+    """
+    meta = {}
+    try:
+        tokens = _tokenize_dta(text)
+        tree = _parse_dta_tree(tokens)
+    except Exception as e:
+        print(f"DTA parse failed: {e}")
+        return meta
+
+    def convert_value(value):
+        if not isinstance(value, str):
+            return value
+        value = value.strip()
+        # Strip either matching double or single quotes.
+        if (len(value) >= 2 and ((value.startswith('"') and value.endswith('"'))
+                or (value.startswith("'") and value.endswith("'")))):
+            value = value[1:-1]
+        if value.lower() == "true":  return True
+        if value.lower() == "false": return False
+        try: return int(value)
+        except ValueError: pass
+        try: return float(value)
+        except ValueError: pass
+        return value
+
+    def convert_list(values):
+        return [convert_value(v) if not isinstance(v, list) else convert_node(v) for v in values]
+
+    def convert_node(node):
+        if not isinstance(node, list) or not node:
+            return convert_value(node)
+        key = convert_value(node[0])
+        if not isinstance(key, str):
+            return convert_list(node)
+        children = node[1:]
+        if not children:
+            return {key: None}
+        if len(children) == 1 and not isinstance(children[0], list):
+            return {key: convert_value(children[0])}
+        if all(not isinstance(child, list) for child in children):
+            return {key: convert_list(children)}
+        # Nested block: (rank (drum 5) (bass 2))
+        result = {}
+        for child in children:
+            if isinstance(child, list):
+                child_data = convert_node(child)
+                if isinstance(child_data, dict):
+                    for child_key, child_value in child_data.items():
+                        # preserve duplicates as lists
+                        if child_key in result:
+                            if not isinstance(result[child_key], list):
+                                result[child_key] = [result[child_key]]
+                            result[child_key].append(child_value)
+                        else:
+                            result[child_key] = child_value
+                else:
+                    result.setdefault("_values", []).append(child_data)
+            else:
+                result.setdefault("_values", []).append(convert_value(child))
+        return {key: result}
+
+    for root in tree:
+        if not isinstance(root, list):
+            continue
+        parsed = convert_node(root)
+        if not isinstance(parsed, dict):
+            continue
+        for key, value in parsed.items():
+            if isinstance(value, dict):
+                meta.update(value)
+            else:
+                meta[key] = value
+
+    return meta
+
+
+# --- MIDI parsing ---
+
+def _read_vlq(data: bytes, pos: int) -> tuple[int, int]:
+    value = 0
+    while True:
+        if pos >= len(data):
+            raise EOFError(f"VLQ read past end of track (pos={pos}, len={len(data)})")
+        b = data[pos]
+        pos += 1
+        value = (value << 7) | (b & 0x7F)
+        if not (b & 0x80):
+            return value, pos
+
+
+def _parse_midi_track(track: bytes) -> list:
+    events = []
+    p = tick = 0
+    running_status = 0
+    while p < len(track):
+        try:
+            delta, p = _read_vlq(track, p)
+        except EOFError:
+            break
+        tick += delta
+        if p >= len(track):
+            break
+        b = track[p]
+        if b & 0x80:
+            status = b
+            if (b & 0xF0) != 0xF0:
+                running_status = b
+            p += 1
+        else:
+            status = running_status
+        try:
+            if status == 0xFF:
+                mtype = track[p]; p += 1
+                mlen, p = _read_vlq(track, p)
+                events.append(('meta', tick, mtype, track[p:p + mlen]))
+                p += mlen
+            elif (status & 0xF0) in (0x80, 0x90, 0xA0, 0xB0, 0xE0):
+                b1 = track[p] if p < len(track) else 0
+                b2 = track[p + 1] if p + 1 < len(track) else 0
+                p += 2
+                events.append(('midi2', tick, status, b1, b2))
+            elif (status & 0xF0) in (0xC0, 0xD0):
+                p += 1
+            elif status in (0xF0, 0xF7):
+                mlen, p = _read_vlq(track, p)
+                p += mlen
+        except (EOFError, IndexError):
+            break
+    return events
+
+
+def _parse_midi_file(data: bytes) -> tuple[int, list, list] | None:
+    """Parse MIDI header and all tracks. Returns (tpq, bpm_map, all_tracks) or None."""
+    if data[:4] != b"MThd":
+        return None
+    _, _fmt, num_tracks, division = struct.unpack(">IHHH", data[4:14])
+    if division & 0x8000:
+        return None
+    tpq = division
+    pos = 14
+    all_tracks = []
+    for _ in range(num_tracks):
+        if data[pos:pos + 4] != b"MTrk":
+            break
+        length = struct.unpack(">I", data[pos + 4:pos + 8])[0]
+        all_tracks.append(_parse_midi_track(data[pos + 8:pos + 8 + length]))
+        pos += 8 + length
+    tempo_map = [(0, 500000)]
+    for e in (all_tracks[0] if all_tracks else []):
+        if e[0] == 'meta' and e[2] == 0x51:
+            tempo_map.append((e[1], struct.unpack(">I", b"\x00" + e[3][:3])[0]))
+    bpm_map = [(t, 60000000.0 / u) for t, u in tempo_map]
+    return tpq, bpm_map, all_tracks
+
+
+def _ticks_to_ms(ticks: np.ndarray, resolution: int, bpm_map: list) -> np.ndarray:
+    if len(ticks) == 0:
+        return np.array([], dtype=np.float64)
+    seg_ticks = np.array([t for t, _ in bpm_map], dtype=np.float64)
+    seg_bpms = np.array([b for _, b in bpm_map], dtype=np.float64)
+    seg_ms = np.zeros(len(seg_ticks), dtype=np.float64)
+    for i in range(1, len(seg_ticks)):
+        seg_ms[i] = seg_ms[i-1] + (seg_ticks[i] - seg_ticks[i-1]) / resolution * (60000.0 / seg_bpms[i-1])
+    idx = np.clip(np.searchsorted(seg_ticks, ticks, side="right") - 1, 0, len(seg_ticks) - 1)
+    return seg_ms[idx] + (ticks - seg_ticks[idx]) / resolution * (60000.0 / seg_bpms[idx])
+
+
+# --- Entry point ---
+
+
+def notes_from_mid(mid_path: Path, debug: bool) -> dict[str, np.ndarray]:
+    try:
+        parsed = _parse_midi_file(mid_path.read_bytes())
+        if parsed is None:
+            return {}
+        tpq, bpm_map, all_tracks = parsed
+        result: dict[str, np.ndarray] = {}
+        for track_events in all_tracks[1:]:
+            name_bytes: bytes | None = None
+            note_ticks: set[int] = set()
+            for e in track_events:
+                if e[0] == 'meta' and e[2] == 0x03:
+                    name_bytes = e[3]
+                elif e[0] == 'midi2' and (e[2] & 0xF0) == 0x90 and e[4] > 0:
+                    note_ticks.add(e[1])
+            if note_ticks and name_bytes is not None:
+                part = name_bytes.decode("utf-8", errors="replace")
+                result[part] = _ticks_to_ms(np.array(sorted(note_ticks), dtype=np.float64), tpq, bpm_map)
+        return result
+    except Exception as e:
+        dprint(debug, f"exception in notes_from_mid: {e}")
+        return {}
+    
+
+# --- Chart parsing — .chart format ---
+
+
+_MIDI_INSTRUMENT_TRACKS = {
+    "PART GUITAR":      "guitar",
+    "PART BASS":        "bass",
+    "PART DRUMS":       "drums",
+    "PART VOCALS":      "vocals",
+    "PART KEYS":        "keys",
+    "PART RHYTHM":      "rhythm",
+    "PART GUITAR COOP": "guitar",
+    "PART REAL_GUITAR": "guitar",
+    "PART REAL_BASS":   "bass",
+    "PART KEYS_X":      "keys",
+}
+
+
+def midi_metadata_from_bytes(data: bytes, debug: bool = False) -> dict:
+    try:
+        parsed = _parse_midi_file(data)
+        if parsed is None:
+            return {}
+        tpq, bpm_map, all_tracks = parsed
+        meta: dict = {}
+        found_sections = []
+        vocal_parts = 0
+        last_tick = 0
+        for track_events in all_tracks:
+            track_name = None
+            has_notes = False
+            for event in track_events:
+                last_tick = max(last_tick, event[1])
+                if event[0] == "meta" and event[2] == 0x03:
+                    track_name = event[3].decode("utf-8", errors="replace")
+                elif event[0] == "meta" and event[2] in (0x01, 0x05):
+                    text = event[3].decode("utf-8", errors="replace")
+                    if text.lower().startswith("["):
+                        found_sections.append(text)
+                elif event[0] == "midi2" and (event[2] & 0xF0) == 0x90 and event[4] > 0:
+                    has_notes = True
+            if track_name:
+                upper = track_name.upper()
+                if upper in _MIDI_INSTRUMENT_TRACKS and has_notes:
+                    meta[f"has_{_MIDI_INSTRUMENT_TRACKS[upper]}"] = True
+                if upper.startswith("HARM"):
+                    vocal_parts += 1
+        if vocal_parts:
+            meta["vocal_parts"] = vocal_parts
+        if last_tick > 0:
+            meta["song_length"] = int(_ticks_to_ms(np.array([last_tick], dtype=np.float64), tpq, bpm_map)[0])
+        if found_sections:
+            meta["sections"] = ",".join(dict.fromkeys(
+                t[9:-1] for t in found_sections if t.lower().startswith("[section")
+            ))
+        return meta
+    except Exception as exc:
+        dprint(debug, f"midi_metadata failed: {exc}")
+        return {}
+
+
+def midi_metadata(mid_path: Path, debug: bool = False) -> dict:
+    try:
+        return midi_metadata_from_bytes(mid_path.read_bytes(), debug)
+    except Exception:
+        return {}
+    
+
+
+# --- STFS / CON parsing — Xbox 360 Rock Band packages ---
+
+
+# --- Album art (Xbox PNG/BC1 texture decoding) ---
+
+HEADER_SIZE = 32
+BC1_BLOCK_SIZE = 8
+
+
+def swap_bc1_endian(data: bytes) -> bytes:
+    """Swap the RGB565 endpoints and the BC1 lookup bytes."""
+    out = bytearray(len(data))
+    for i in range(0, len(data), 8):
+        block = bytearray(data[i:i + 8])
+        if len(block) < 8:
+            break
+        # RGB565 endpoints
+        block[0], block[1] = block[1], block[0]
+        block[2], block[3] = block[3], block[2]
+        # BC1 lookup table
+        block[4], block[5] = block[5], block[4]
+        block[6], block[7] = block[7], block[6]
+        out[i:i + 8] = block
+    return bytes(out)
+
+
+def decode_png_xbox(raw: bytes):
+    width = height = 256
+    image_size = (width // 4) * (height // 4) * BC1_BLOCK_SIZE
+    pixel_data = swap_bc1_endian(raw[HEADER_SIZE:HEADER_SIZE + image_size])
+    rgba = texture2ddecoder.decode_bc1(pixel_data, width, height)
+    return Image.frombytes("RGBA", (width, height), rgba, "raw", "BGRA")
+
+
+# --- MOGG audio splitting (ffmpeg stem separation) ---
+
+def _split_mogg(mogg_bytes: bytes, dest_dir: Path, debug: bool, song_info: dict | None,
+                cancel_event: threading.Event | None = None) -> None:
+
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError(
+            "ffmpeg not found on PATH — install it with 'winget install Gyan.FFmpeg' to use _split_mogg()"
+        )
+
+    # Locate the OggS stream inside the mogg container
+    if len(mogg_bytes) >= 8:
+        ogg_offset = struct.unpack("<I", mogg_bytes[4:8])[0]
+        if ogg_offset < len(mogg_bytes) and mogg_bytes[ogg_offset:ogg_offset + 4] == b"OggS":
+            ogg_bytes = mogg_bytes[ogg_offset:]
+        else:
+            ogg_pos = mogg_bytes.find(b"OggS")
+            ogg_bytes = mogg_bytes[ogg_pos:] if ogg_pos >= 0 else mogg_bytes
+    else:
+        ogg_bytes = mogg_bytes
+
+    y_multi, sr_orig = sf.read(io.BytesIO(ogg_bytes), always_2d=True, dtype="float32")
+    dprint(debug, f"mogg read OK: {y_multi.shape[1]} channels, sr={sr_orig}")
+
+    # Resolve stem names from DTA track info, fall back to defaults
+    TEMP_STEM_NAMES = {0: "drums", 1: "bass", 2: "guitar", 3: "vocals", 4: "backing"}
+    stem_names = {}
+    try:
+        if song_info is not None:
+            values = (song_info.get('tracks') or {}).get('_values')
+            if isinstance(values, list) and isinstance(values[0], list):
+                for i, entry in enumerate(values[0]):
+                    stem_name = list(entry.keys())[0]
+                    stem_names[i] = "drums" if stem_name == "drum" else stem_name
+    except Exception as e:
+        print(e)
+        stem_names = TEMP_STEM_NAMES
+    if not stem_names:
+        stem_names = TEMP_STEM_NAMES
+
+    # Build a filter graph that:
+    # 1. Splits the multitrack MOGG into individual channels.
+    # 2. Mixes channels according to the DTA metadata.
+    # 3. Writes one OGG per stem.
+
+    n_ch = y_multi.shape[1]
+    filter_parts = []
+
+    # Build stereo mixdown of all stems (even channels → left, odd → right)
+    left_channels = "+".join(f"c{ch}" for ch in range(0, n_ch, 2))
+    right_channels = "+".join(f"c{ch}" for ch in range(1, n_ch, 2))
+    filter_parts.append(f"[0:a]pan=stereo|c0={left_channels}|c1={right_channels}[mix]")
+
+    output_args = ["-map", "[mix]", "-c:a", "libvorbis", "-q:a", "8", "-threads", "0", str(dest_dir / "song.ogg")]
+
+    for ch0 in range(0, n_ch, 2):
+        pair_idx = ch0 // 2
+        stem_path = dest_dir / f"{stem_names.get(pair_idx, f'stem_{pair_idx+1}')}.ogg"
+        if ch0 + 1 < n_ch:
+            filter_parts.append(f"[0:a]pan=stereo|c0=c{ch0}|c1=c{ch0+1}[stem{pair_idx}]")
+        else:
+            filter_parts.append(f"[0:a]pan=mono|c0=c{ch0}[stem{pair_idx}]")
+        output_args += ["-map", f"[stem{pair_idx}]", "-c:a", "libvorbis", "-q:a", "8", "-threads", "0", str(stem_path)]
+
+    # Run all stems in one ffmpeg process
+    done_event = threading.Event()
+    proc = subprocess.Popen(
+        ["ffmpeg", "-y", "-i", "pipe:0", "-filter_complex", ";".join(filter_parts)] + output_args,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+
+    def _watch_cancel():
+        if cancel_event is not None:
+            cancel_event.wait()
+            if not done_event.is_set():  # only kill if ffmpeg is still running
+                proc.kill()
+
+    watcher = threading.Thread(target=_watch_cancel, daemon=True)
+    watcher.start()
+
+    try:
+        stdout, stderr = proc.communicate(input=ogg_bytes)
+        if proc.returncode != 0:
+            raise RuntimeError(f"ffmpeg failed: {stderr.decode(errors='replace')}")
+    finally:
+        done_event.set()   # tell watcher ffmpeg is done, don't kill
+        watcher.join(timeout=1)
+        if cancel_event is not None and cancel_event.is_set():
+            raise InterruptedError("cancelled during ffmpeg")
+        
+
+# --- Chart parsing — MIDI format ---
+
+
+# --- song.ini writing & extraction-cache helpers ---
+
+def _write_song_ini(dest_dir: Path, name: str, artist: str, extra: dict) -> None:
+    """Write song.ini from extracted metadata, skipping numeric-only keys and reserved fields."""
+    SKIP_KEYS = {"name", "title", "artist", "delay", "song"}
+    lines = ["[song]", f"name = {name}", f"artist = {artist}", "delay = 0"]
+    lines += [f"{key} = {value}" for key, value in extra.items()
+              if not str(key).isdigit() and key not in SKIP_KEYS]
+    (dest_dir / "song.ini").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _has_audio(folder: Path) -> bool:
+    return any(p.stat().st_size > 0 for p in folder.glob("*") if p.suffix.lower() in EXTENSION_LIST)
+
+
+def find_audio_candidates(folder: Path) -> list[Path]:
+    """Return audio files sorted by stem priority then alphabetically."""
+
+    candidates = [
+        p for p in folder.rglob("*")
+        if p.is_file()
+        and p.suffix.lower() in EXTENSION_LIST
+        and p.stem.lower() not in STEM_IGNORE
+        and p.stem.lower() in STEM_CANDIDATES
+    ]
+    if len(candidates) == 0:
+        dprint(True, "No audio candidates were found. Fallback to song audio.")
+        to_add = [
+            p for p in folder.rglob("song.*")
+            if p.is_file()
+            and p.suffix.lower() in EXTENSION_LIST
+        ]
+        candidates += to_add
+    return candidates
+
+
+def _is_extraction_cache_fresh(source: Path, dest: Path, require_chart_or_mid: bool = False) -> bool:
+    if not _has_audio(dest):
+        return False
+    if require_chart_or_mid:
+        has_chart = (dest / "notes.mid").exists() or (dest / "notes.chart").exists()
+        return has_chart and source.stat().st_mtime <= dest.stat().st_mtime
+    return (dest / "notes.mid").exists() and source.stat().st_mtime <= dest.stat().st_mtime
+
+
+# --- CON extraction (Xbox 360 package -> folder) ---
+
+def con_extract_to_folder(
+    con_path: Path,
+    dest_dir: Path | None = None,
+    debug: bool = False,
+    overwrite: bool = False,
+    cancel_event: threading.Event | None = None,
+) -> Path:
+    dest_dir = _prepare_con_extraction_folder(con_path, dest_dir, debug, overwrite)
+    data = con_path.read_bytes()
+    display, files = _extract_stfs_files(data, con_path, dest_dir, debug)
+
+    art_png_info = files.get("art_png")
+    if art_png_info:
+        name, raw = art_png_info
+        dprint(debug, f"Album art: {name} ({len(raw)} bytes)")
+        try:
+            decode_png_xbox(raw).save(dest_dir / "album.png")
+            dprint(debug, "Album art extracted successfully.")
+        except Exception as e:
+            dprint(debug, f"Failed to decode album art ({name}): {e}")
+
+    dta_meta = _load_dta_metadata(files, debug)
+    mid_bytes, mogg_bytes = _load_song_assets(data, files, debug)
+
+    if mid_bytes:
+        for key, value in midi_metadata_from_bytes(mid_bytes, debug).items():
+            dta_meta.setdefault(key, value)
+
+    song_info = _write_con_song_ini(con_path, dest_dir, display, dta_meta)
+    _write_song_assets(dest_dir, mid_bytes, mogg_bytes, debug, song_info, cancel_event=cancel_event)
+    return dest_dir
+
+
+def _prepare_con_extraction_folder(con_path: Path, dest_dir: Path | None, debug: bool, overwrite: bool) -> Path:
+    if dest_dir is None:
+        dest_dir = Path(str(con_path) + "_extracted")
+    if dest_dir.exists():
+        if not overwrite:
+            raise FileExistsError(f"The folder '{dest_dir}' already exists.")
+        if _is_extraction_cache_fresh(con_path, dest_dir):
+            dprint(debug, "skipping extraction, cache is fresh")
+            return dest_dir
+    dprint(debug, f"creating folder {dest_dir}")
+    try:
+        if dest_dir.exists() and dest_dir.is_dir():
+            # Iterate over items in reverse order to remove nested files/folders first
+            for item in sorted(dest_dir.rglob("*"), reverse=True):
+                if item.is_file():
+                    item.unlink()
+                elif item.is_dir():
+                    item.rmdir()
+            dest_dir.rmdir()
+    except Exception:
+        raise
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    return dest_dir
+
+
+def _extract_stfs_files(data: bytes, con_path: Path, dest_dir: Path, debug: bool) -> tuple[str, dict[str, tuple[str, bytes]]]:
+    files: dict[str, tuple[str, bytes]] = {}
+    display = con_path.stem
+    try:
+        info = _stfs_parse_header(data, debug)
+        display = info.get("display_name") or con_path.stem
+        entries = _stfs_list_files(data, info, debug)
+
+        for entry in entries:
+            if entry["is_dir"] or entry["size"] == 0:
+                dprint(debug, f"[refused entry]\n      [entry] {entry}")
+                continue
+
+            is_contiguous = entry.get("alloc_blocks", 0) > 0
+            raw = _stfs_read_file(data, entry["first_blk"], entry["size"],
+                                  info["table_size_shift"], is_contiguous=is_contiguous, debug=debug)
+            if not raw:
+                continue
+
+            (dest_dir / entry["name"]).write_bytes(raw)
+            kind = _classify_con_entry(entry["name"])
+
+            if kind is None:
+                if not any(entry["name"].lower().endswith(ext) for ext in _CON_KNOWN_IGNORED):
+                    dprint(debug, f"Kind is none: {entry['name']}. Song: {con_path.name}")
+                continue
+
+            files.setdefault(kind, (entry["name"], raw))
+            dprint(debug, f"extracted {entry['name']} ({len(raw):,} bytes) as {kind}")
+
+    except Exception as exc:
+        print(exc)
+
+    return display, files
+
+
+def _load_dta_metadata(files: dict, debug: bool) -> dict:
+    dta_bytes = files.get("dta", (None, None))[1]
+    if not dta_bytes:
+        return {}
+    return _parse_songs_dta(dta_bytes.decode("utf-8", errors="ignore"))
+
+
+def _load_song_assets(data: bytes, files: dict, debug: bool) -> tuple[bytes | None, bytes | None]:
+    mid_bytes = files.get("mid", (None, None))[1]
+    mogg_bytes = files.get("mogg", (None, None))[1]
+    if mid_bytes is not None and mogg_bytes is not None:
+        return mid_bytes, mogg_bytes
+    fb_mid, fb_mogg = _stfs_fallback_scan(data, debug)
+    return mid_bytes or fb_mid, mogg_bytes or fb_mogg
+
+
+def _write_song_assets(dest_dir: Path, mid_bytes: bytes | None, mogg_bytes: bytes | None,
+                       debug: bool, song_info: dict | None, cancel_event: threading.Event | None = None) -> None:
+    if mid_bytes:
+        (dest_dir / "notes.mid").write_bytes(mid_bytes)
+    if mogg_bytes:
+        _split_mogg(mogg_bytes, dest_dir, debug, song_info=song_info, cancel_event=cancel_event)
+
+
+def _write_con_song_ini(con_path: Path, dest_dir: Path, display: str, dta_meta: dict) -> dict | None:
+    con_parts = con_path.name.split(" - ")
+    default_artist = con_parts[0] if len(con_parts) > 0 else "Unknown Artist"
+    default_name = con_parts[-1] if len(con_parts) > 1 else display
+
+    name = dta_meta.get("name") or dta_meta.get("title") or default_name
+    if "/" in name:
+        name = default_name  # Small fallback just in case
+    artist = dta_meta.get("artist") or default_artist
+
+    key_change = {
+        "year_released": "year", "album_name": "album", "author": "charter",
+        "preview_start": "preview_start_time", "preview_end": "preview_end_time",
+        "album_track_number": "album_track", "game_origin": "icon",
+    }
+
+    extra = {}
+    for key, value in dta_meta.items():
+        if key == "preview":
+            if isinstance(value, list) and len(value) >= 2:
+                extra["preview_start_time"] = value[0]
+                extra["preview_end_time"] = value[1]
+            continue
+        if key == "rank":
+            if isinstance(value, dict):
+                for instrument, rank_val in value.items():
+                    if instrument in STEM_CANDIDATES:
+                        try:
+                            rank = int(rank_val)
+                            # Map CON rank (1..1000) → YARG difficulty (0..16)
+                            # f(1)=0, f(500)=8, f(999)=15, f(1000)=16
+                            n = 1000; m = (n-2)/15; k = -m/2+2
+                            diff = max(0, min(16, round((rank-k)/m)))
+                            extra[f"diff_{instrument}"] = diff
+                        except (TypeError, ValueError):
+                            pass
+            continue
+        extra[key_change.get(key, key)] = value
+
+    song_blob = dta_meta.get("song")
+    if isinstance(song_blob, dict):
+        extra.setdefault("vocal_parts", song_blob.get("vocal_parts"))
+
+    _write_song_ini(dest_dir, name, artist, extra)
+    return extra.get("song")
+
+
+# --- SNG extraction (Clone Hero / YARG format) ---
+
+def sng_extract_to_folder(
+    sng_path: Path,
+    dest_dir: Path | None = None,
+    debug: bool = False,
+    overwrite: bool = False,
+    cancel_event: threading.Event | None = None,  # ignored for now
+) -> Path:
+    """Extract a .sng container to a folder."""
+    dest_dir = _prepare_sng_extraction_folder(sng_path, dest_dir, overwrite, debug)
+    data = sng_path.read_bytes()
+    pos = 0
+
+    # Header
+    if len(data) < 26 or data[:6] != SNG_MAGIC:
+        raise ValueError(f"Not an SNG file (bad magic): {sng_path}")
+
+    pos += 6
+    version = struct.unpack_from("<I", data, pos)[0]; pos += 4
+    xor_mask = data[pos:pos + 16]; pos += 16
+    dprint(debug, f"SNG version={version}, xor_mask={xor_mask.hex()}")
+
+    # Metadata section
+    _meta_len = struct.unpack_from("<Q", data, pos)[0]; pos += 8
+    meta_count = struct.unpack_from("<Q", data, pos)[0]; pos += 8
+    metadata: dict[str, str] = {}
+    for _ in range(meta_count):
+        key_len = struct.unpack_from("<i", data, pos)[0]; pos += 4
+        key = data[pos:pos + key_len].decode("utf-8", errors="replace"); pos += key_len
+        val_len = struct.unpack_from("<i", data, pos)[0]; pos += 4
+        val = data[pos:pos + val_len].decode("utf-8", errors="replace"); pos += val_len
+        metadata[key] = val
+    dprint(debug, f"SNG metadata ({len(metadata)} keys): name={metadata.get('name')!r} artist={metadata.get('artist')!r}")
+
+    # File index section
+    _idx_len = struct.unpack_from("<Q", data, pos)[0]; pos += 8
+    file_count = struct.unpack_from("<Q", data, pos)[0]; pos += 8
+    file_metas: list[tuple[str, int, int]] = []
+    for _ in range(file_count):
+        fname_len = data[pos]; pos += 1
+        fname = data[pos:pos + fname_len].decode("utf-8", errors="replace"); pos += fname_len
+        contents_len = struct.unpack_from("<Q", data, pos)[0]; pos += 8
+        contents_idx = struct.unpack_from("<Q", data, pos)[0]; pos += 8
+        file_metas.append((fname, contents_len, contents_idx))
+
+    dprint(debug, f"SNG file index: {file_count} entries")
+    if debug:
+        for fname, clen, cidx in file_metas:
+            dprint(debug, f"{fname}: {clen:,} bytes @ abs offset {cidx}")
+
+    pos += 8  # skip FileData section-length field
+    _extract_sng_files(data, xor_mask, file_metas, dest_dir, debug)
+    _write_sng_song_ini(sng_path, dest_dir, metadata, debug)
+    return dest_dir
+
+
+# --- MIDI metadata extraction ---
+
+
+def _sng_unmask(data: bytes, xor_mask: bytes) -> bytes:
+    """Unmask file bytes. i resets to 0 for each file."""
+    out = bytearray(len(data))
+    for i, b in enumerate(data):
+        xor_key = xor_mask[i % 16] ^ (i & 0xFF)
+        out[i] = b ^ xor_key
+    return bytes(out)
+
+
+def _prepare_sng_extraction_folder(sng_path: Path, dest_dir: Path | None, overwrite: bool, debug: bool) -> Path:
+    if dest_dir is None:
+        dest_dir = Path(str(sng_path) + "_extracted")
+    if dest_dir.exists() and not overwrite:
+        if _is_extraction_cache_fresh(sng_path, dest_dir, require_chart_or_mid=True):
+            dprint(debug, f"SNG: skipping extraction, cache is fresh: {dest_dir}")
+            return dest_dir
+        raise FileExistsError(f"The folder '{dest_dir}' already exists.")
+    return dest_dir
+
+
+def _extract_sng_files(data: bytes, xor_mask: bytes, file_metas: list[tuple[str, int, int]],
+                       dest_dir: Path, debug: bool) -> None:
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for fname, contents_len, contents_idx in file_metas:
+        fname_safe = Path(fname).name
+        if not fname_safe or fname_safe.startswith("."):
+            dprint(debug, f"SNG: skipping unsafe filename '{fname}'")
+            continue
+        abs_end = contents_idx + contents_len
+        if abs_end > len(data):
+            dprint(debug, f"SNG: '{fname}' out of bounds, skipping")
+            continue
+        unmasked = _sng_unmask(data[contents_idx:abs_end], xor_mask)
+        out_path = dest_dir / fname
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(unmasked)
+        dprint(debug, f"SNG extracted '{fname}' ({contents_len:,} bytes)")
+
+
+def _write_sng_song_ini(sng_path: Path, dest_dir: Path, metadata: dict[str, str], debug: bool) -> None:
+    if (dest_dir / "song.ini").exists():
+        return
+    name = metadata.get("name") or sng_path.stem
+    artist = metadata.get("artist") or "Unknown Artist"
+    extra = {k: v for k, v in metadata.items() if k not in ("name", "artist", "delay")}
+    _write_song_ini(dest_dir, name, artist, extra)
+    dprint(debug, f"SNG wrote song.ini ({len(extra) + 3} lines)")
+
+
+# --- Library orchestration ---
+
+def pre_extract_all(
+    cons: list[Path],
+    sngs: list[Path],
+    overwrite: bool,
+    debug: bool,
+    workers: int,
+    cancel_event: threading.Event,
+    delete_cons: bool,
+    delete_sngs: bool,
+    dry_run: bool,
+) -> dict[Path, Path]:
+    """
+    Pre-extract all CON/SNG files in parallel before calibration.
+    Returns a dict mapping pkg_path -> extracted_folder / song.ini
+    """
+    if not cons and not sngs:
+        return {}
+
+    print(bold(f"\nExtracting {len(cons)} CON + {len(sngs)} SNG files..."))
+
+    extracted: dict[Path, Path] = {}
+    name_width = MAX_SONG_NAME
+    executor = ThreadPoolExecutor(max_workers=workers)
+    jobs = (
+        [(p, "CON", con_extract_to_folder, delete_cons) for p in cons] +
+        [(p, "SNG", sng_extract_to_folder, delete_sngs) for p in sngs]
+    )
+
+    futures = {
+        executor.submit(extract_fn, pkg_path, debug=debug, overwrite=overwrite,  # type: ignore[arg-name]
+                        cancel_event=cancel_event): (pkg_path, fmt_label, delete_file)
+        for pkg_path, fmt_label, extract_fn, delete_file in jobs
+    }
+
+    try:
+        total = len(futures)
+        avg_time = -1.0
+        start_time = time.perf_counter()
+
+        for i, fut in enumerate(futures, 1):
+            pkg_path, fmt_label, delete_file = futures[fut]
+            display = pkg_path.name[:name_width - 3] + "..." if len(pkg_path.name) > name_width else pkg_path.name
+            padded = f"{display:<{name_width}}"
+            try:
+                t0 = time.perf_counter()
+                song_folder = fut.result()
+                elapsed = time.perf_counter() - t0
+                avg_time = elapsed if avg_time < 0 else avg_time * (1 - ETA_EMA_ALPHA) + elapsed * ETA_EMA_ALPHA
+
+                remaining = total - i
+                eta_sec = int(avg_time * remaining / workers) if avg_time > 0 and remaining > 0 else 0
+                eta_m, eta_s = divmod(eta_sec, 60)
+                eta_h, eta_m = divmod(eta_m, 60)
+                eta_str = dim(f"  [{eta_h}h{eta_m}m{eta_s:02}s left, {avg_time:.1f}s/file]")
+
+                audio_files = find_audio_candidates(song_folder)
+                size_mb = sum(f.stat().st_size for f in audio_files) / (1024 * 1024)
+                print(f"{green('ok  ')}  {padded}  {fmt_label} extracted  ({len(audio_files)} audio files, {size_mb:.1f} MB){eta_str}  (done {i}/{total})")
+                extracted[pkg_path] = song_folder / "song.ini"
+
+                if delete_file and not dry_run:
+                    try:
+                        pkg_path.unlink()
+                    except Exception as e:
+                        dprint(debug, f"could not delete {fmt_label}: {e}")
+
+            except (KeyboardInterrupt, InterruptedError):
+                raise
+            except Exception as exc:
+                print(f"{red('skip')}  {padded}  {fmt_label} extraction failed: {exc}  (done {i}/{total})")
+
+    except (KeyboardInterrupt, InterruptedError):
+        print("\n[!] Extraction interrupted.")
+        cancel_event.set()
+        executor.shutdown(wait=False, cancel_futures=True)
+        for fut, (pkg_path, fmt_label, delete_file) in futures.items():
+            dest_dir = Path(str(pkg_path) + "_extracted")
+            if dest_dir.exists() and not _is_extraction_cache_fresh(pkg_path, dest_dir):
+                shutil.rmtree(dest_dir, ignore_errors=True)
+        raise
+    else:
+        executor.shutdown(wait=True)
+
+    return extracted
+
+
+def process_library(
+    root: Path,
+    dry_run: bool,
+    debug: bool,
+    workers: int = WORKER_THREADS,
+    delete_cons: bool = False,
+    delete_sngs: bool = False,
+    overwrite: bool = False,
+    skip_extracted: bool = False
+) -> None:
+    print()
+    if delete_cons and not dry_run:
+        print(red(bold("  WARNING: --delete-cons is set. CON files will be permanently deleted after extraction.")))
+        print("  Press Ctrl+C to abort...\n")
+
+    print("Scanning songs...")
+    # First scan — full, for display only
+    all_songs, _, _, _, _, cons, sngs = get_song_list(
+        root, skip_extracted=skip_extracted
+    )
+    if not all_songs:
+        print("No songs found.")
+        return
+
+    cancel_event = threading.Event()
+    _ = pre_extract_all(cons, sngs, overwrite, debug, workers,
+                                        cancel_event, delete_cons, delete_sngs, dry_run)
+
+# --- DTA metadata parsing (Rock Band songs.dta) ---
+
+
+# --- Entry point ---
+
+class _Tee:
+    """Writes to multiple streams simultaneously (e.g. stdout + log file)."""
+    def __init__(self, *streams):
+        self.streams = streams
+    def write(self, data: str) -> None:
+        for s in self.streams:
+            s.write(data)
+    def flush(self) -> None:
+        for s in self.streams:
+            s.flush()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Auto-calibrate YARG song.ini delay values.")
+    parser.add_argument("library",                   type=Path,       help="Path to your YARG song library")
+    parser.add_argument("--dry-run",                 action="store_true", help="Preview changes without writing")
+    parser.add_argument("--debug",                   action="store_true", help="Show scoring details for all target song files")
+    parser.add_argument("--workers",                 type=int, default=WORKER_THREADS, help=f"Number of parallel worker threads (default: {WORKER_THREADS})")
+    parser.add_argument("--delete-cons",             action="store_true", help="Delete CON files that are extracted. Destructive.")
+    parser.add_argument("--delete-sngs",             action="store_true", help="Delete SNG files that are extracted. Destructive.")
+    parser.add_argument("--overwrite",               action="store_true", help="Overwrite existing folder during CON and SNG extraction.")
+    parser.add_argument("--skip-extracted",          action="store_true", help="Skip all song folders that were extracted from CON or SNG files.")
+    parser.add_argument("--shutdown-after",          action="store_true", help="Shutdown system after calibration, useful to run while sleeping.")
+    args = parser.parse_args()
+
+    if not args.library.is_dir():
+        sys.exit(red(f"Not a directory: {args.library}"))
+
+    log_file = None
+    if args.shutdown_after:
+        timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+        log_file = open(Path(__file__).parent / f"yarg_sync_log_{timestamp}.txt", "w", encoding="utf-8")
+        sys.stdout = _Tee(sys.__stdout__, log_file)
+        sys.stderr = _Tee(sys.__stderr__, log_file)
+
+    interrupted = False
+    try:
+        process_library(
+            args.library,
+            dry_run=args.dry_run,
+            debug=args.debug,
+            workers=args.workers,
+            delete_cons=args.delete_cons,
+            delete_sngs=args.delete_sngs,
+            overwrite=args.overwrite,
+            skip_extracted=args.skip_extracted
+        )
+    except KeyboardInterrupt:
+        interrupted = True
+
+    if args.shutdown_after and not interrupted:
+        if log_file is not None:
+            sys.stdout = sys.__stdout__
+            sys.stderr = sys.__stderr__
+            log_file.close()
+        time.sleep(1)
+        if os.name == "nt":
+            subprocess.run(["shutdown", "/s", "/t", "0"])
+        else:
+            subprocess.run(["shutdown", "now"])
+
+
+if __name__ == "__main__":
+    main()
+
