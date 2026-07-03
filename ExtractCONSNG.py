@@ -970,6 +970,7 @@ def _write_con_song_ini(con_path: Path, dest_dir: Path, display: str, dta_meta: 
     default_name = con_parts[-1] if len(con_parts) > 1 else display
 
     name = dta_meta.get("name") or dta_meta.get("title") or default_name
+    name = str(name)
     if "/" in name:
         name = default_name  # Small fallback just in case
     artist = dta_meta.get("artist") or default_artist
