@@ -35,27 +35,24 @@ def convert_mp4_to_webm(
         if backup_path.exists():
             return False, f"✗ Failed: Skipping {input_path.name}: backup already exists."
 
-        command = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel", "error",
-            "-progress", "pipe:1",
-            "-nostats",
-            "-y",
-            "-i", str(input_path),
-            "-map", "0",
-            "-c:v", "libvpx",
-            "-deadline", "good",   # Guarantees optimal speed/quality heuristic
-            "-cpu-used", "1",      # Keep at 1 for quality; threading handles the speed
-            "-threads", "4",       # Set to your CPU's actual thread count
-            "-slices", "4",        # Enables true multi-threaded slicing for VP8
-            "-crf", "20",
-            "-b:v", "8M",
-            "-qmin", "0",
-            "-c:a", "libopus",
-            "-b:a", "192k",
-            str(output_path),
-        ]
+        command = ["ffmpeg",
+                    "-i", str(input_path),
+                    "-map", "0",
+                      "-c:v", "libvpx",
+                   "-deadline", "best", 
+                   "-cpu-used", "0", 
+                   "-crf", "5",
+                   "-b:v", "4M", 
+                   "-minrate", "3M", 
+                   "-maxrate", "7M",
+                   "-c:a", "libopus", 
+                   "-b:a", "192k",
+                   "-progress", "pipe:1", 
+                   "-nostats", 
+                   "-loglevel", "error", 
+                   "-y",
+                   str(output_path)
+                   ]
 
         try:
             probe = subprocess.run(
@@ -72,39 +69,29 @@ def convert_mp4_to_webm(
             )
 
             duration = float(probe.stdout.strip())
+            if duration <= 0:
+                raise ValueError("Could not determine input duration")
 
             process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
+                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1
             )
-
             if process.stdout is not None:
                 for line in process.stdout:
                     if "=" not in line:
                         continue
-
                     key, value = line.strip().split("=", 1)
-
                     if key == "out_time_ms":
                         pct = min(float(value) / 1_000_000 / duration, 1.0)
-
                         with progress_lock:
                             progress[worker_id] = (
                                 f"{input_path.parent.name}/{input_path.name}",
                                 pct,
                             )
-
             process.wait()
             stderr_output = process.stderr.read() if process.stderr else ""
-
             if process.returncode != 0:
                 raise subprocess.CalledProcessError(
-                    process.returncode,
-                    command,
-                    stderr=stderr_output or "Unknown FFmpeg error",
+                    process.returncode, command, stderr=stderr_output or "Unknown FFmpeg error"
                 )
 
             # Verify the output is a valid, complete file before trusting it enough
@@ -133,7 +120,7 @@ def convert_mp4_to_webm(
                     output_path.unlink()
                 return False, f"✗ Skipped (cancelled): {input_path.parent.name}/{input_path.name}"
 
-            shutil.move(input_path, backup_path)
+            # shutil.move(input_path, backup_path)
             return True, f"✓ Success ({backup_path.parent.name}/{backup_path.name} created)"
 
         except KeyboardInterrupt:
@@ -165,6 +152,7 @@ def process_directory(
     max_workers: int | None = None,
 ) -> None:
     """Recursively convert every MP4 that has not already been converted."""
+    print("Careful. Quality will go down unfortunately. Cancel now if mp4 works for you.\nUse 'Restore MP4BAK.py' to restore your files afterwards.")
     t0 = time.perf_counter()
 
     RESET = "\033[0m"
@@ -215,12 +203,12 @@ def process_directory(
                     else alpha * instant_rate + (1 - alpha) * smoothed_rate["value"]
                 )
 
-                eta = (total_files - effective_done) / smoothed_rate["value"] if smoothed_rate["value"] > 0 else None
-                eta_m = eta // 60 if eta else None
-                eta_h = eta_m // 60 if eta_m else None
-                eta = eta % 60 if eta else None
-                eta_m = eta_m % 60 if eta_m else None
-                eta_str = f"{eta_h:5.0f}h {eta_m:02.0f}m {eta:02.0f}s" if eta is not None else "  ...."
+                eta = (total_files - effective_done) / smoothed_rate["value"] if smoothed_rate["value"] > 0 else 0
+                eta_m = eta // 60
+                eta_h = eta_m // 60
+                eta = eta % 60
+                eta_m = eta_m % 60
+                eta_str = f"{eta_h:5.0f}h {eta_m:02.0f}m {eta:02.0f}s"
 
                 overall_pct = effective_done / total_files if total_files else 1.0
                 overall_filled = int(bar_width * overall_pct)
