@@ -708,7 +708,7 @@ def decode_png_xbox(raw: bytes):
 # --- MOGG audio splitting (ffmpeg stem separation) ---
 
 def _split_mogg(mogg_bytes: bytes, dest_dir: Path, debug: bool, song_info: dict | None,
-                cancel_event: threading.Event | None = None) -> None:
+                quality: int = 6, cancel_event: threading.Event | None = None) -> None:
 
     if shutil.which("ffmpeg") is None:
         raise RuntimeError(
@@ -758,7 +758,7 @@ def _split_mogg(mogg_bytes: bytes, dest_dir: Path, debug: bool, song_info: dict 
     right_channels = "+".join(f"c{ch}" for ch in range(1, n_ch, 2))
     filter_parts.append(f"[0:a]pan=stereo|c0={left_channels}|c1={right_channels}[mix]")
 
-    output_args = ["-map", "[mix]", "-c:a", "libvorbis", "-q:a", "8", "-threads", "0", str(dest_dir / "song.ogg")]
+    output_args = ["-map", "[mix]", "-c:a", "libvorbis", "-q:a", f"{quality}", "-threads", "0", str(dest_dir / "song.ogg")]
 
     for ch0 in range(0, n_ch, 2):
         pair_idx = ch0 // 2
@@ -767,7 +767,7 @@ def _split_mogg(mogg_bytes: bytes, dest_dir: Path, debug: bool, song_info: dict 
             filter_parts.append(f"[0:a]pan=stereo|c0=c{ch0}|c1=c{ch0+1}[stem{pair_idx}]")
         else:
             filter_parts.append(f"[0:a]pan=mono|c0=c{ch0}[stem{pair_idx}]")
-        output_args += ["-map", f"[stem{pair_idx}]", "-c:a", "libvorbis", "-q:a", "8", "-threads", "0", str(stem_path)]
+        output_args += ["-map", f"[stem{pair_idx}]", "-c:a", "libvorbis", "-q:a", f"{quality}", "-threads", "0", str(stem_path)]
 
     # Run all stems in one ffmpeg process
     done_event = threading.Event()
@@ -848,6 +848,7 @@ def _is_extraction_cache_fresh(source: Path, dest: Path, require_chart_or_mid: b
 
 def con_extract_to_folder(
     con_path: Path,
+    dump_raw: bool,
     dest_dir: Path | None = None,
     debug: bool = False,
     overwrite: bool = False,
@@ -855,7 +856,7 @@ def con_extract_to_folder(
 ) -> Path:
     dest_dir = _prepare_con_extraction_folder(con_path, dest_dir, debug, overwrite)
     data = con_path.read_bytes()
-    display, files = _extract_stfs_files(data, con_path, dest_dir, debug)
+    display, files = _extract_stfs_files(data, con_path, dest_dir, debug, dump_raw)
 
     art_png_info = files.get("art_png")
     if art_png_info:
@@ -904,7 +905,7 @@ def _prepare_con_extraction_folder(con_path: Path, dest_dir: Path | None, debug:
     return dest_dir
 
 
-def _extract_stfs_files(data: bytes, con_path: Path, dest_dir: Path, debug: bool) -> tuple[str, dict[str, tuple[str, bytes]]]:
+def _extract_stfs_files(data: bytes, con_path: Path, dest_dir: Path, debug: bool, dump_raw: bool) -> tuple[str, dict[str, tuple[str, bytes]]]:
     files: dict[str, tuple[str, bytes]] = {}
     display = con_path.stem
     try:
@@ -923,7 +924,8 @@ def _extract_stfs_files(data: bytes, con_path: Path, dest_dir: Path, debug: bool
             if not raw:
                 continue
 
-            (dest_dir / entry["name"]).write_bytes(raw)
+            if dump_raw:
+                (dest_dir / entry["name"]).write_bytes(raw)
             kind = _classify_con_entry(entry["name"])
 
             if kind is None:
@@ -1016,6 +1018,7 @@ def _write_con_song_ini(con_path: Path, dest_dir: Path, display: str, dta_meta: 
 
 def sng_extract_to_folder(
     sng_path: Path,
+    dump_raw: bool,
     dest_dir: Path | None = None,
     debug: bool = False,
     overwrite: bool = False,
@@ -1133,11 +1136,13 @@ def pre_extract_all(
     delete_cons: bool,
     delete_sngs: bool,
     dry_run: bool,
+    dump_raw: bool
 ) -> dict[Path, Path]:
     """
     Pre-extract all CON/SNG files in parallel before calibration.
     Returns a dict mapping pkg_path -> extracted_folder / song.ini
     """
+    
     if not cons and not sngs:
         return {}
 
@@ -1152,7 +1157,8 @@ def pre_extract_all(
     )
 
     futures = {
-        executor.submit(extract_fn, pkg_path, debug=debug, overwrite=overwrite,  # type: ignore[arg-name]
+        executor.submit(extract_fn, pkg_path, dump_raw=dump_raw,  # type: ignore[arg-name]
+                         debug=debug, overwrite=overwrite,
                         cancel_event=cancel_event): (pkg_path, fmt_label, delete_file)
         for pkg_path, fmt_label, extract_fn, delete_file in jobs
     }
@@ -1217,9 +1223,11 @@ def process_library(
     delete_cons: bool = False,
     delete_sngs: bool = False,
     overwrite: bool = False,
-    skip_extracted: bool = False
+    skip_extracted: bool = False,
+    dump_raw: bool = False
 ) -> None:
     print()
+    t0 = time.perf_counter()
     if delete_cons and not dry_run:
         print(red(bold("  WARNING: --delete-cons is set. CON files will be permanently deleted after extraction.")))
         print("  Press Ctrl+C to abort...\n")
@@ -1229,13 +1237,15 @@ def process_library(
     all_songs, _, _, _, _, cons, sngs = get_song_list(
         root, skip_extracted=skip_extracted
     )
+    print(f"Scan took {time.perf_counter() - t0:.0f} seconds.")
     if not all_songs:
         print("No songs found.")
         return
 
     cancel_event = threading.Event()
     _ = pre_extract_all(cons, sngs, overwrite, debug, workers,
-                                        cancel_event, delete_cons, delete_sngs, dry_run)
+                                        cancel_event, delete_cons, delete_sngs, dry_run, dump_raw)
+    print(f"Extracted {len(cons) + len(sngs)} songs in {time.perf_counter() - t0:.0f} seconds.")
 
 # --- DTA metadata parsing (Rock Band songs.dta) ---
 
@@ -1264,6 +1274,7 @@ def main() -> None:
     parser.add_argument("--delete-sngs",             action="store_true", help="Delete SNG files that are extracted. Destructive.")
     parser.add_argument("--overwrite",               action="store_true", help="Overwrite existing folder during CON and SNG extraction.")
     parser.add_argument("--skip-extracted",          action="store_true", help="Skip all song folders that were extracted from CON or SNG files.")
+    parser.add_argument("--dump-raw",                action="store_true", help="Dump all the raw files found in CON or SNG packages.")
     parser.add_argument("--shutdown-after",          action="store_true", help="Shutdown system after calibration, useful to run while sleeping.")
     args = parser.parse_args()
 
@@ -1287,7 +1298,8 @@ def main() -> None:
             delete_cons=args.delete_cons,
             delete_sngs=args.delete_sngs,
             overwrite=args.overwrite,
-            skip_extracted=args.skip_extracted
+            skip_extracted=args.skip_extracted,
+            dump_raw=args.dump_raw
         )
     except KeyboardInterrupt:
         interrupted = True

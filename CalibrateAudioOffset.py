@@ -1563,6 +1563,7 @@ def process_library(
     delete_sngs: bool = False,
     overwrite: bool = False,
     skip_extracted: bool = False,
+    dump_raw: bool = False,
     hard_score: bool = False,
     tolerance: int | None = None,
     hop_length: int | None = None,
@@ -1612,8 +1613,7 @@ def process_library(
 
     cancel_event = threading.Event()
     if extract:
-        extracted_map = ExtractCONSNG.pre_extract_all(cons, sngs, overwrite, debug, workers,
-                                        cancel_event, delete_cons, delete_sngs, dry_run)
+        extracted_map = ExtractCONSNG.pre_extract_all(cons, sngs, overwrite, debug, workers, cancel_event, delete_cons, delete_sngs, dry_run, dump_raw)
     if extract_only:
         return
 
@@ -1939,6 +1939,7 @@ def main() -> None:
     parser.add_argument("--delete-sngs",             action="store_true", help="Delete SNG files that are extracted. Destructive.")
     parser.add_argument("--overwrite",               action="store_true", help="Overwrite existing folder during CON and SNG extraction.")
     parser.add_argument("--skip-extracted",          action="store_true", help="Skip all song folders that were extracted from CON or SNG files.")
+    parser.add_argument("--dump-raw",                action="store_true", help="Dump all the raw files found in CON or SNG packages.")
     parser.add_argument("--shutdown-after",          action="store_true", help="Shutdown system after calibration, useful to run while sleeping.")
     parser.add_argument("--hard-score",              action="store_true", help="Use hard scoring (binary match within tolerance) instead of soft scoring.")
     parser.add_argument("--tolerance",               type=int, default=None, help=f"Onset match window in ms (default: {TOLERANCE_MS}). Try 15 for sharper discrimination.")
@@ -1977,6 +1978,7 @@ def main() -> None:
             delete_sngs=args.delete_sngs,
             overwrite=args.overwrite,
             skip_extracted=args.skip_extracted,
+            dump_raw=args.dump_raw,
             hard_score=args.hard_score,
             tolerance=args.tolerance,
             hop_length=args.hop_length,
