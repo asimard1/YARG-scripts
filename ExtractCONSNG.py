@@ -17,7 +17,7 @@ try:
     import sys
     import threading
     import time
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     from pathlib import Path
     import shutil
     from PIL import Image
@@ -1126,6 +1126,11 @@ def _write_sng_song_ini(sng_path: Path, dest_dir: Path, metadata: dict[str, str]
 
 # --- Library orchestration ---
 
+def _timed_extract(extract_fn, pkg_path, **kwargs):
+    t0 = time.perf_counter()
+    result = extract_fn(pkg_path, **kwargs)
+    return result, time.perf_counter() - t0
+
 def pre_extract_all(
     cons: list[Path],
     sngs: list[Path],
@@ -1157,8 +1162,8 @@ def pre_extract_all(
     )
 
     futures = {
-        executor.submit(extract_fn, pkg_path, dump_raw=dump_raw,  # type: ignore[arg-name]
-                         debug=debug, overwrite=overwrite,
+        executor.submit(_timed_extract, extract_fn, pkg_path, dump_raw=dump_raw,
+                        debug=debug, overwrite=overwrite,
                         cancel_event=cancel_event): (pkg_path, fmt_label, delete_file)
         for pkg_path, fmt_label, extract_fn, delete_file in jobs
     }
@@ -1166,16 +1171,13 @@ def pre_extract_all(
     try:
         total = len(futures)
         avg_time = -1.0
-        start_time = time.perf_counter()
 
-        for i, fut in enumerate(futures, 1):
+        for i, fut in enumerate(as_completed(futures), 1):
             pkg_path, fmt_label, delete_file = futures[fut]
             display = pkg_path.name[:name_width - 3] + "..." if len(pkg_path.name) > name_width else pkg_path.name
             padded = f"{display:<{name_width}}"
             try:
-                t0 = time.perf_counter()
-                song_folder = fut.result()
-                elapsed = time.perf_counter() - t0
+                song_folder, elapsed = fut.result()
                 avg_time = elapsed if avg_time < 0 else avg_time * (1 - ETA_EMA_ALPHA) + elapsed * ETA_EMA_ALPHA
 
                 remaining = total - i
