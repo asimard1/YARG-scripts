@@ -123,16 +123,17 @@ def dprint(debug: bool, msg: str, always_print: bool = False) -> None:
 
 # --- File & library scanning ---
 
-def _check_magic(path: Path, magics: tuple[bytes, ...]) -> bool:
+def _check_magic(path: Path, magics: tuple[bytes, ...], debug: bool=False) -> bool:
     try:
         with path.open("rb") as f:
             head = f.read(max(len(m) for m in magics))
+            dprint(debug, f"Head: {str(head)}")
             return any(head.startswith(m) for m in magics)
     except Exception:
         return False
 
 
-def is_con_file(path: Path) -> bool: return _check_magic(path, CON_MAGIC)
+def is_con_file(path: Path, debug: bool=False) -> bool: return _check_magic(path, CON_MAGIC, debug)
 def is_sng_file(path: Path) -> bool: return _check_magic(path, (SNG_MAGIC,))
 
 
@@ -143,6 +144,7 @@ def is_extracted_path(p: Path) -> bool:
 def get_song_list(
     root: Path,
     skip_extracted: bool = False,
+    debug: bool = False
 ) -> tuple[list[Path], int, int, int, list, list, list]:
 
     cons = sorted(
@@ -196,7 +198,7 @@ def _stfs_next_block(data: bytes, block: int, table_size_shift: int) -> int:
 
 def _stfs_read_file(data: bytes, first_block: int, file_size: int,
                     table_size_shift: int, is_contiguous: bool = False,
-                    debug: bool = False) -> bytes:
+                    debug: bool = False, dbg_name: str | None = None) -> bytes:
     if file_size == 0:
         print("File size is zero")
         return b""
@@ -206,12 +208,15 @@ def _stfs_read_file(data: bytes, first_block: int, file_size: int,
     block = first_block
     seen: set[int] = set()
     guard = file_size // _STFS_BLOCK + 16
+    crossed_boundary = False
 
     while remaining > 0 and guard > 0:
         if block in seen:
             dprint(debug, f"SEEN BLOCK {block}")
             break
         seen.add(block)
+        if block >= 0xAA:
+            crossed_boundary = True
         off = _stfs_block_offset(block, table_size_shift)
         take = min(remaining, _STFS_BLOCK)
         if off < 0 or off >= len(data):
@@ -230,7 +235,19 @@ def _stfs_read_file(data: bytes, first_block: int, file_size: int,
 
     if guard <= 0 and debug:
         print("GUARD EXPIRED")
+
+    if dbg_name:
+        flag = " [CROSSED 0xAA BOUNDARY]" if crossed_boundary else ""
+        print(f"[stfs-read] {dbg_name}: first_blk={first_block:#x} "
+              f"want={file_size} got={len(out)}{flag}")
+
     return bytes(out)
+
+
+def _debug_check_mid(name: str, raw: bytes) -> None:
+    ok = raw[:4] == b"MThd"
+    print(f"[mid-check] {name}: {'OK' if ok else 'BAD HEADER'} "
+          f"({len(raw)} bytes, starts {raw[:8]!r})")
 
 
 def _stfs_utf16be(data: bytes, offset: int, max_chars: int) -> str:
@@ -254,8 +271,8 @@ def _stfs_parse_header(data: bytes, debug: bool) -> dict:
     try:
         # table_size_shift: 1 if ((EntryID + 0xFFF) & 0xF000) >> 0xC == 0xB else 0
         # We force it to 0 (matches observed CON behaviour)
-        info["table_size_shift"] = 0
-        dprint(debug, "[FORCED] table_size_shift = 0")
+        info["table_size_shift"] = int(os.environ.get("STFS_SHIFT_OVERRIDE", "0"))
+        dprint(debug, f"[FORCED] table_size_shift = {info['table_size_shift']}")
         vd_base = 0x037A
         info["ftbl_count"] = struct.unpack("<H", data[vd_base + 0x02:vd_base + 0x04])[0]
         info["ftbl_start"] = int.from_bytes(data[vd_base + 0x04:vd_base + 0x07], "big")
@@ -1006,6 +1023,30 @@ def _sanitize_folder_name(name: str) -> str:
     return name or "song"
 
 
+def _entry_suffix_after_basename(entry_name: str, basename: str) -> str:
+    """Returns the part of the filename after the basename (before the extension)."""
+    stem = entry_name.rsplit(".", 1)[0]
+    return stem[len(basename):] if stem.lower().startswith(basename.lower()) else stem
+
+
+def _set_kind_with_priority(files: dict, kind: str, name: str, raw: bytes, basename: str) -> None:
+    """Store (name, raw) under `kind`, preferring exact basename matches over
+    any variant with an underscore suffix (e.g. '_orig', '_alt', '_old')."""
+    suffix = _entry_suffix_after_basename(name, basename)
+    is_suffixed = suffix.startswith("_")
+
+    existing = files.get(kind)
+    if existing is None:
+        files[kind] = (name, raw)
+        return
+
+    existing_suffix = _entry_suffix_after_basename(existing[0], basename)
+    existing_is_suffixed = existing_suffix.startswith("_")
+
+    if existing_is_suffixed and not is_suffixed:
+        files[kind] = (name, raw)  # new one is the "clean" name, replace
+
+
 def _entry_matches_song_basename(entry_name: str, basename: str) -> bool:
     """True if an STFS entry belongs to the given song basename.
     Requires an exact prefix match followed by '.' or '_' (or nothing) so
@@ -1070,15 +1111,18 @@ def con_extract_multi_to_folder(
             if not _entry_matches_song_basename(entry["name"], basename):
                 continue
             raw = _stfs_read_file(data, entry["first_blk"], entry["size"], table_size_shift,
-                                  is_contiguous=entry.get("alloc_blocks", 0) > 0, debug=debug)
+                                  is_contiguous=entry.get("alloc_blocks", 0) > 0, debug=debug,
+                                  dbg_name=f"{basename}/{entry['name']}")
             if not raw:
                 continue
             if dump_raw:
                 (song_dest / "raw").mkdir(parents=True, exist_ok=True)
                 (song_dest / "raw" / entry["name"]).write_bytes(raw)
             kind = _classify_con_entry(entry["name"])
+            if kind == "mid":
+                _debug_check_mid(f"{basename}/{entry['name']}", raw)
             if kind:
-                files[kind] = (entry["name"], raw)
+                _set_kind_with_priority(files, kind, entry["name"], raw, basename)
 
         art_png_info = files.get("art_png")
         if art_png_info:
@@ -1158,10 +1202,16 @@ def _prepare_con_extraction_folder(con_path: Path, dest_dir: Path | None, debug:
                                    create_folder_with_number: bool = False) -> Path | None:
     if dest_dir is None:
         dest_dir = Path(str(con_path) + "_extracted")
+    try:
+        print("stat:", dest_dir.stat())
+    except Exception as e:
+        print("stat failed:", e)
     if dest_dir.exists():
         if not overwrite:
             print("Should we add a test here?")
             print(f"I want to create the folder: {dest_dir}")
+            print(repr(str(dest_dir)))
+            print(dest_dir.resolve())
             if not create_folder_with_number:
                 raise FileExistsError(f"The folder '{dest_dir}' already exists.")
             else:
@@ -1219,7 +1269,8 @@ def _extract_stfs_files(data: bytes, con_path: Path, dest_dir: Path, debug: bool
 
             is_contiguous = entry.get("alloc_blocks", 0) > 0
             raw = _stfs_read_file(data, entry["first_blk"], entry["size"],
-                                  info["table_size_shift"], is_contiguous=is_contiguous, debug=debug)
+                                  info["table_size_shift"], is_contiguous=is_contiguous, debug=debug,
+                                  dbg_name=entry["name"])
             if not raw:
                 continue
 
@@ -1227,6 +1278,8 @@ def _extract_stfs_files(data: bytes, con_path: Path, dest_dir: Path, debug: bool
                 (dest_dir / "raw").mkdir(parents=True, exist_ok=True)
                 (dest_dir / "raw" / entry["name"]).write_bytes(raw)
             kind = _classify_con_entry(entry["name"])
+            if kind == "mid":
+                _debug_check_mid(entry["name"], raw)
 
             if kind is None:
                 if not any(entry["name"].lower().endswith(ext) for ext in _CON_KNOWN_IGNORED):
@@ -1555,7 +1608,7 @@ def pre_extract_all(
         for fut, (pkg_path, fmt_label, delete_file) in futures.items():
             dest_dir = Path(str(pkg_path) + "_extracted")
             if dest_dir.exists() and not _is_extraction_cache_fresh(pkg_path, dest_dir):
-                shutil.rmtree(dest_dir, ignore_errors=True)
+                shutil.rmtree(dest_dir)
         raise
     else:
         executor.shutdown(wait=True)
@@ -1583,7 +1636,7 @@ def process_library(
     print("Scanning songs...")
     # First scan — full, for display only
     all_songs, _, _, _, _, cons, sngs = get_song_list(
-        root, skip_extracted=skip_extracted
+        root, skip_extracted=skip_extracted, debug=debug
     )
     print(f"Scan took {time.perf_counter() - t0:.0f} seconds.")
     if not all_songs:
