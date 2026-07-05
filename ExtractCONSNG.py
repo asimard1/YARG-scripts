@@ -19,12 +19,11 @@ try:
     import time
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from pathlib import Path
+    from typing import Callable
     import shutil
     from PIL import Image
     import texture2ddecoder
-
     import numpy as np
-    import soundfile as sf
 except ImportError as e:
     pkg = str(e).split("'")[-2] if "'" in str(e) else "required dependencies"
     print(f"Error: Could not import {pkg}.")
@@ -62,7 +61,7 @@ WORKER_THREADS = 6
 ETA_EMA_ALPHA = 0.1
 
 # File format magic bytes
-CON_MAGIC = b"CON "
+CON_MAGIC = (b"CON ", b"LIVE", b"PIRS")
 SNG_MAGIC = b"SNGPKG"
 STEM_CANDIDATES = [
     "bass", "drums", "drum", "drums_1", "drums_2", "drums_3", "drums_4",
@@ -122,16 +121,17 @@ def dprint(debug: bool, msg: str, always_print: bool = False) -> None:
 
 # --- File & library scanning ---
 
-def _check_magic(path: Path, magic: bytes) -> bool:
+def _check_magic(path: Path, magics: tuple[bytes, ...]) -> bool:
     try:
         with path.open("rb") as f:
-            return f.read(len(magic)) == magic
+            head = f.read(max(len(m) for m in magics))
+            return any(head.startswith(m) for m in magics)
     except Exception:
         return False
 
 
 def is_con_file(path: Path) -> bool: return _check_magic(path, CON_MAGIC)
-def is_sng_file(path: Path) -> bool: return _check_magic(path, SNG_MAGIC)
+def is_sng_file(path: Path) -> bool: return _check_magic(path, (SNG_MAGIC,))
 
 
 def is_extracted_path(p: Path) -> bool:
@@ -145,7 +145,9 @@ def get_song_list(
 
     cons = sorted(
         p for p in root.rglob("*")
-        if p.is_file() and is_con_file(p)
+        if p.is_file()
+        and p.suffix not in EXTENSION_LIST + [".ini", ".mid", ".bak", ".webm", ".mp4", ".png"]
+        and is_con_file(p)
     )
     sngs = sorted(root.rglob("*.sng"))
 
@@ -406,82 +408,97 @@ def _parse_dta_tree(tokens):
     return roots
 
 
-def _parse_songs_dta(text: str) -> dict:
-    """Parse Rock Band songs.dta (Lisp-like S-expressions) into a Python dict.
-    Handles simple scalars (artist "Foo") and nested structures (tracks (drum (0 1)) ..).
+def _dta_convert_value(value):
+    if not isinstance(value, str):
+        return value
+    value = value.strip()
+    # Strip either matching double or single quotes.
+    if (len(value) >= 2 and ((value.startswith('"') and value.endswith('"'))
+            or (value.startswith("'") and value.endswith("'")))):
+        value = value[1:-1]
+    if value.lower() == "true":  return True
+    if value.lower() == "false": return False
+    try: return int(value)
+    except ValueError: pass
+    try: return float(value)
+    except ValueError: pass
+    return value
+
+
+def _dta_convert_list(values):
+    return [_dta_convert_value(v) if not isinstance(v, list) else _dta_convert_node(v) for v in values]
+
+
+def _dta_convert_node(node):
+    if not isinstance(node, list) or not node:
+        return _dta_convert_value(node)
+    key = _dta_convert_value(node[0])
+    if not isinstance(key, str):
+        return _dta_convert_list(node)
+    children = node[1:]
+    if not children:
+        return {key: None}
+    if len(children) == 1 and not isinstance(children[0], list):
+        return {key: _dta_convert_value(children[0])}
+    if all(not isinstance(child, list) for child in children):
+        return {key: _dta_convert_list(children)}
+    # Nested block: (rank (drum 5) (bass 2))
+    result = {}
+    for child in children:
+        if isinstance(child, list):
+            child_data = _dta_convert_node(child)
+            if isinstance(child_data, dict):
+                for child_key, child_value in child_data.items():
+                    # preserve duplicates as lists
+                    if child_key in result:
+                        if not isinstance(result[child_key], list):
+                            result[child_key] = [result[child_key]]
+                        result[child_key].append(child_value)
+                    else:
+                        result[child_key] = child_value
+            else:
+                result.setdefault("_values", []).append(child_data)
+        else:
+            result.setdefault("_values", []).append(_dta_convert_value(child))
+    return {key: result}
+
+
+def _parse_songs_dta_grouped(text: str) -> dict[str, dict]:
+    """Parse a songs.dta into {shortname: metadata_dict}, one entry per song.
+    A single-song CON produces one entry; a multi-song CON pack (e.g. Rock
+    Band Network compilations) produces one entry per bundled song, keyed by
+    its DTA shortname (e.g. 'spoonman2', 'UGC_5000196').
     """
-    meta = {}
+    songs: dict[str, dict] = {}
     try:
         tokens = _tokenize_dta(text)
         tree = _parse_dta_tree(tokens)
     except Exception as e:
         print(f"DTA parse failed: {e}")
-        return meta
-
-    def convert_value(value):
-        if not isinstance(value, str):
-            return value
-        value = value.strip()
-        # Strip either matching double or single quotes.
-        if (len(value) >= 2 and ((value.startswith('"') and value.endswith('"'))
-                or (value.startswith("'") and value.endswith("'")))):
-            value = value[1:-1]
-        if value.lower() == "true":  return True
-        if value.lower() == "false": return False
-        try: return int(value)
-        except ValueError: pass
-        try: return float(value)
-        except ValueError: pass
-        return value
-
-    def convert_list(values):
-        return [convert_value(v) if not isinstance(v, list) else convert_node(v) for v in values]
-
-    def convert_node(node):
-        if not isinstance(node, list) or not node:
-            return convert_value(node)
-        key = convert_value(node[0])
-        if not isinstance(key, str):
-            return convert_list(node)
-        children = node[1:]
-        if not children:
-            return {key: None}
-        if len(children) == 1 and not isinstance(children[0], list):
-            return {key: convert_value(children[0])}
-        if all(not isinstance(child, list) for child in children):
-            return {key: convert_list(children)}
-        # Nested block: (rank (drum 5) (bass 2))
-        result = {}
-        for child in children:
-            if isinstance(child, list):
-                child_data = convert_node(child)
-                if isinstance(child_data, dict):
-                    for child_key, child_value in child_data.items():
-                        # preserve duplicates as lists
-                        if child_key in result:
-                            if not isinstance(result[child_key], list):
-                                result[child_key] = [result[child_key]]
-                            result[child_key].append(child_value)
-                        else:
-                            result[child_key] = child_value
-                else:
-                    result.setdefault("_values", []).append(child_data)
-            else:
-                result.setdefault("_values", []).append(convert_value(child))
-        return {key: result}
+        return songs
 
     for root in tree:
-        if not isinstance(root, list):
+        if not isinstance(root, list) or not root:
             continue
-        parsed = convert_node(root)
+        parsed = _dta_convert_node(root)
         if not isinstance(parsed, dict):
             continue
         for key, value in parsed.items():
             if isinstance(value, dict):
-                meta.update(value)
-            else:
-                meta[key] = value
+                songs[key] = value
 
+    return songs
+
+
+def _parse_songs_dta(text: str) -> dict:
+    """Parse Rock Band songs.dta (Lisp-like S-expressions) into a flat Python dict.
+    Handles simple scalars (artist "Foo") and nested structures (tracks (drum (0 1)) ..).
+    For multi-song packs this flattens all songs together (last one wins on
+    conflicting keys) — use _parse_songs_dta_grouped() to keep songs separate.
+    """
+    meta: dict = {}
+    for value in _parse_songs_dta_grouped(text).values():
+        meta.update(value)
     return meta
 
 
@@ -707,18 +724,28 @@ def decode_png_xbox(raw: bytes):
 
 # --- MOGG audio splitting (ffmpeg stem separation) ---
 
-def _split_mogg(mogg_bytes: bytes, dest_dir: Path, debug: bool, song_info: dict | None,
-                quality: int = 6, cancel_event: threading.Event | None = None) -> None:
+def _split_mogg(
+    mogg_bytes: bytes,
+    dest_dir: Path,
+    debug: bool,
+    song_info: dict | None,
+    quality: int = 6,
+    cancel_event: threading.Event | None = None,
+) -> None:
 
     if shutil.which("ffmpeg") is None:
         raise RuntimeError(
             "ffmpeg not found on PATH — install it with 'winget install Gyan.FFmpeg' to use _split_mogg()"
         )
+    ffprobe_found = True
+    if shutil.which("ffprobe") is None:
+        print("ffprobe not found on PATH — reverting to soundfile")
+        ffprobe_found = False
 
-    # Locate the OggS stream inside the mogg container
+    # Locate OggS stream inside MOGG
     if len(mogg_bytes) >= 8:
         ogg_offset = struct.unpack("<I", mogg_bytes[4:8])[0]
-        if ogg_offset < len(mogg_bytes) and mogg_bytes[ogg_offset:ogg_offset + 4] == b"OggS":
+        if 0 <= ogg_offset < len(mogg_bytes) and mogg_bytes[ogg_offset:ogg_offset + 4] == b"OggS":
             ogg_bytes = mogg_bytes[ogg_offset:]
         else:
             ogg_pos = mogg_bytes.find(b"OggS")
@@ -726,60 +753,179 @@ def _split_mogg(mogg_bytes: bytes, dest_dir: Path, debug: bool, song_info: dict 
     else:
         ogg_bytes = mogg_bytes
 
-    y_multi, sr_orig = sf.read(io.BytesIO(ogg_bytes), always_2d=True, dtype="float32")
-    dprint(debug, f"mogg read OK: {y_multi.shape[1]} channels, sr={sr_orig}")
+    # Probe channel count via ffprobe (no full decode)
+    def _get_channel_count(data: bytes) -> int:
+        if ffprobe_found:
+            cmd = [
+                "ffprobe",
+                "-v", "error",
+                "-select_streams", "a:0",
+                "-show_entries", "stream=channels",
+                "-of", "default=nokey=1:noprint_wrappers=1",
+                "pipe:0",
+            ]
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+            except FileNotFoundError as e:
+                raise RuntimeError(
+                    f"Executable not found: {e.filename!r} while running: {' '.join(cmd)}"
+                ) from e
 
-    # Resolve stem names from DTA track info, fall back to defaults
-    TEMP_STEM_NAMES = {0: "drums", 1: "bass", 2: "guitar", 3: "vocals", 4: "backing"}
-    stem_names = {}
+            out, _ = proc.communicate(input=data)
+            try:
+                return int(out.strip())
+            except Exception:
+                return 2
+        else:
+            import soundfile as sf
+            y_multi, sr_orig = sf.read(io.BytesIO(ogg_bytes), always_2d=True, dtype="float32")
+            dprint(debug, f"mogg read OK: {y_multi.shape[1]} channels, sr={sr_orig}")
+            return y_multi.shape[1]
+
+    n_ch = _get_channel_count(ogg_bytes)
+    dprint(debug, f"MOGG channels detected: {n_ch}")
+
+    TEMP_STEM_NAMES = {
+        "drum": "drums",
+        "bass": "bass",
+        "guitar": "guitar",
+        "vocals": "vocals",
+        "keys": "keys",
+        "crowd": "crowd",
+        "backing": "backing",
+        "rhythm": "rhythm",
+    }
+
+    stem_names: dict[int, str | None] = {}
+    assigned_channels: set[int] = set()
+
+    # Parse DTA-style tracks
     try:
-        if song_info is not None:
-            values = (song_info.get('tracks') or {}).get('_values')
-            if isinstance(values, list) and isinstance(values[0], list):
-                for i, entry in enumerate(values[0]):
-                    stem_name = list(entry.keys())[0]
-                    stem_names[i] = "drums" if stem_name == "drum" else stem_name
+        if song_info:
+            tracks = (song_info.get("tracks") or {}).get("_values")
+            if isinstance(tracks, list) and tracks and isinstance(tracks[0], list):
+                group = tracks[0]
+                for i, entry in enumerate(group):
+                    if not isinstance(entry, dict):
+                        continue
+                    name = next(iter(entry.keys()), None)
+                    if not name:
+                        continue
+
+                    raw = entry[name].get("_values", [])
+                    channels = []
+                    if raw and isinstance(raw[0], list):
+                        channels = raw[0]
+                    elif isinstance(raw, list):
+                        channels = raw
+
+                    if not isinstance(channels, list):
+                        continue
+
+                    stem_name = TEMP_STEM_NAMES.get(name, name)
+                    stem_names[i] = stem_name
+                    for c in channels:
+                        if isinstance(c, int):
+                            assigned_channels.add(c)
+
     except Exception as e:
-        print(e)
-        stem_names = TEMP_STEM_NAMES
-    if not stem_names:
-        stem_names = TEMP_STEM_NAMES
+        dprint(debug, f"DTA parse error: {e}")
 
-    # Build a filter graph that:
-    # 1. Splits the multitrack MOGG into individual channels.
-    # 2. Mixes channels according to the DTA metadata.
-    # 3. Writes one OGG per stem.
+    # Any unassigned channels become "backing"
+    unassigned = [c for c in range(n_ch) if c not in assigned_channels]
+    if unassigned:
+        stem_names[len(stem_names)] = "backing"
+        stem_channels_extra = unassigned
+    else:
+        stem_channels_extra = []
 
-    n_ch = y_multi.shape[1]
+    # Build ffmpeg filter graph
     filter_parts = []
 
-    # Build stereo mixdown of all stems (even channels → left, odd → right)
-    left_channels = "+".join(f"c{ch}" for ch in range(0, n_ch, 2))
-    right_channels = "+".join(f"c{ch}" for ch in range(1, n_ch, 2))
-    filter_parts.append(f"[0:a]pan=stereo|c0={left_channels}|c1={right_channels}[mix]")
+    left_channels = "+".join(f"c{c}" for c in range(0, n_ch, 2))
+    right_channels = "+".join(f"c{c}" for c in range(1, n_ch, 2))
 
-    output_args = ["-map", "[mix]", "-c:a", "libvorbis", "-q:a", f"{quality}", "-threads", "0", str(dest_dir / "song.ogg")]
-
-    for ch0 in range(0, n_ch, 2):
-        pair_idx = ch0 // 2
-        stem_path = dest_dir / f"{stem_names.get(pair_idx, f'stem_{pair_idx+1}')}.ogg"
-        if ch0 + 1 < n_ch:
-            filter_parts.append(f"[0:a]pan=stereo|c0=c{ch0}|c1=c{ch0+1}[stem{pair_idx}]")
-        else:
-            filter_parts.append(f"[0:a]pan=mono|c0=c{ch0}[stem{pair_idx}]")
-        output_args += ["-map", f"[stem{pair_idx}]", "-c:a", "libvorbis", "-q:a", f"{quality}", "-threads", "0", str(stem_path)]
-
-    # Run all stems in one ffmpeg process
-    done_event = threading.Event()
-    proc = subprocess.Popen(
-        ["ffmpeg", "-y", "-i", "pipe:0", "-filter_complex", ";".join(filter_parts)] + output_args,
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    filter_parts.append(
+        f"[0:a]pan=stereo|c0={left_channels}|c1={right_channels}[mix]"
     )
+
+    def _pan(channels: list[int], label: str) -> str:
+        if len(channels) == 1:
+            return f"[0:a]pan=mono|c0=c{channels[0]}[{label}]"
+        if len(channels) == 2:
+            return f"[0:a]pan=stereo|c0=c{channels[0]}|c1=c{channels[1]}[{label}]"
+        left = "+".join(f"c{c}" for c in channels[::2])
+        right = "+".join(f"c{c}" for c in channels[1::2])
+        return f"[0:a]pan=stereo|c0={left}|c1={right}[{label}]"
+
+    output_args = [
+        "-map", "[mix]",
+        "-c:a", "libvorbis",
+        "-q:a", str(quality),
+        str(dest_dir / "song.ogg"),
+    ]
+
+    # Build stems from DTA
+    for idx, name in stem_names.items():
+        channels = []
+        try:
+            assert song_info is not None
+            entry = song_info["tracks"]["_values"][0][idx][name]["_values"][0]
+            channels = entry if isinstance(entry, list) else []
+        except Exception:
+            channels = []
+
+        if not channels:
+            continue
+
+        label = f"stem{idx}"
+        filter_parts.append(_pan(channels, label))
+
+        out_path = dest_dir / f"{name}.ogg"
+        output_args += [
+            "-map", f"[{label}]",
+            "-c:a", "libvorbis",
+            "-q:a", str(quality),
+            str(out_path),
+        ]
+
+    # Add backing stem if needed
+    if stem_channels_extra:
+        label = "stem_backing"
+        filter_parts.append(_pan(stem_channels_extra, label))
+
+        out_path = dest_dir / "backing.ogg"
+        output_args += [
+            "-map", f"[{label}]",
+            "-c:a", "libvorbis",
+            "-q:a", str(quality),
+            str(out_path),
+        ]
+
+    done_event = threading.Event()
+
+    cmd = ["ffmpeg", "-y", "-i", "pipe:0", "-filter_complex", ";".join(filter_parts)] + output_args
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            f"Executable not found: {e.filename!r} while running: {' '.join(cmd)}"
+        ) from e
 
     def _watch_cancel():
         if cancel_event is not None:
             cancel_event.wait()
-            if not done_event.is_set():  # only kill if ffmpeg is still running
+            if not done_event.is_set():
                 proc.kill()
 
     watcher = threading.Thread(target=_watch_cancel, daemon=True)
@@ -790,11 +936,11 @@ def _split_mogg(mogg_bytes: bytes, dest_dir: Path, debug: bool, song_info: dict 
         if proc.returncode != 0:
             raise RuntimeError(f"ffmpeg failed: {stderr.decode(errors='replace')}")
     finally:
-        done_event.set()   # tell watcher ffmpeg is done, don't kill
+        done_event.set()
         watcher.join(timeout=1)
         if cancel_event is not None and cancel_event.is_set():
-            raise InterruptedError("cancelled during ffmpeg")
-        
+            raise InterruptedError("cancelled during mogg split")
+
 
 # --- Chart parsing — MIDI format ---
 
@@ -807,6 +953,8 @@ def _write_song_ini(dest_dir: Path, name: str, artist: str, extra: dict) -> None
     lines = ["[song]", f"name = {name}", f"artist = {artist}", "delay = 0"]
     lines += [f"{key} = {value}" for key, value in extra.items()
               if not str(key).isdigit() and key not in SKIP_KEYS]
+    if not dest_dir.exists():
+        dest_dir.mkdir(parents=True, exist_ok=True)
     (dest_dir / "song.ini").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -814,16 +962,20 @@ def _has_audio(folder: Path) -> bool:
     return any(p.stat().st_size > 0 for p in folder.glob("*") if p.suffix.lower() in EXTENSION_LIST)
 
 
-def find_audio_candidates(folder: Path) -> list[Path]:
+def find_audio_candidates(folder: Path, calibration=True) -> list[Path]:
     """Return audio files sorted by stem priority then alphabetically."""
 
     candidates = [
         p for p in folder.rglob("*")
         if p.is_file()
         and p.suffix.lower() in EXTENSION_LIST
-        and p.stem.lower() not in STEM_IGNORE
-        and p.stem.lower() in STEM_CANDIDATES
     ]
+    if calibration:
+        candidates = [
+            p for p in candidates
+            if p.stem.lower() not in STEM_IGNORE
+            and p.stem.lower() in STEM_CANDIDATES
+        ]
     if len(candidates) == 0:
         dprint(True, "No audio candidates were found. Fallback to song audio.")
         to_add = [
@@ -836,15 +988,122 @@ def find_audio_candidates(folder: Path) -> list[Path]:
 
 
 def _is_extraction_cache_fresh(source: Path, dest: Path, require_chart_or_mid: bool = False) -> bool:
-    if not _has_audio(dest):
-        return False
-    if require_chart_or_mid:
-        has_chart = (dest / "notes.mid").exists() or (dest / "notes.chart").exists()
-        return has_chart and source.stat().st_mtime <= dest.stat().st_mtime
-    return (dest / "notes.mid").exists() and source.stat().st_mtime <= dest.stat().st_mtime
+    # if not _has_audio(dest):
+    #     return False
+    # if require_chart_or_mid:
+    #     has_chart = (dest / "notes.mid").exists() or (dest / "notes.chart").exists()
+    #     return has_chart and source.stat().st_mtime <= dest.stat().st_mtime
+    # return (dest / "notes.mid").exists() and source.stat().st_mtime <= dest.stat().st_mtime
+    return False # still needs some work, can't check for unfinished .ogg files or deleted files
 
 
 # --- CON extraction (Xbox 360 package -> folder) ---
+
+def _sanitize_folder_name(name: str) -> str:
+    name = re.sub(r'[<>:"/\\|?*]', "_", name).strip(" .")
+    return name or "song"
+
+
+def _entry_matches_song_basename(entry_name: str, basename: str) -> bool:
+    """True if an STFS entry belongs to the given song basename.
+    Requires an exact prefix match followed by '.' or '_' (or nothing) so
+    'spoonman2' doesn't accidentally match 'spoonman20.mid'.
+    """
+    if not entry_name.lower().startswith(basename.lower()):
+        return False
+    rest = entry_name[len(basename):]
+    return rest == "" or rest[0] in "._"
+
+
+def _find_multi_song_dta(entries: list[dict], data: bytes, table_size_shift: int, debug: bool) -> dict[str, dict]:
+    """Return {shortname: meta} if this CON bundles 2+ songs, else {}."""
+    dta_entry = next((e for e in entries if e["name"].lower() == "songs.dta"), None)
+    if not dta_entry:
+        return {}
+    raw = _stfs_read_file(data, dta_entry["first_blk"], dta_entry["size"], table_size_shift,
+                          is_contiguous=dta_entry.get("alloc_blocks", 0) > 0, debug=debug)
+    if not raw:
+        return {}
+    grouped = _parse_songs_dta_grouped(raw.decode("utf-8", errors="ignore"))
+    return grouped if len(grouped) > 1 else {}
+
+
+def con_extract_multi_to_folder(
+    con_path: Path,
+    songs_meta: dict[str, dict],
+    entries: list[dict],
+    data: bytes,
+    table_size_shift: int,
+    dump_raw: bool,
+    dest_dir: Path | None = None,
+    debug: bool = False,
+    overwrite: bool = False,
+    cancel_event: threading.Event | None = None,
+    on_song_done: Callable[[Path, float], None] | None = None,
+) -> list[Path]:
+    """Extract a multi-song CON pack (e.g. RBN compilation) into one subfolder
+    per bundled song under dest_dir. Returns the list of per-song folders."""
+    base_dest = dest_dir or Path(str(con_path) + "_extracted")
+    base_dest.mkdir(parents=True, exist_ok=True)
+    results: list[Path] = []
+    t_prev = time.perf_counter()
+
+    for shortname, meta in songs_meta.items():
+        song_blob = meta.get("song")
+        basename = shortname
+        if isinstance(song_blob, dict) and isinstance(song_blob.get("name"), str) and song_blob["name"]:
+            basename = song_blob["name"].rsplit("/", 1)[-1]
+
+        title = meta.get("name") or basename
+        artist = meta.get("artist") or "Unknown Artist"
+        folder_name = _sanitize_folder_name(f"{artist} - {title}")
+        song_dest = _prepare_con_extraction_folder(con_path, base_dest / folder_name, debug, overwrite)
+        if song_dest is None:
+            continue
+
+        files: dict[str, tuple[str, bytes]] = {}
+        for entry in entries:
+            if entry["is_dir"] or entry["size"] == 0:
+                continue
+            if not _entry_matches_song_basename(entry["name"], basename):
+                continue
+            raw = _stfs_read_file(data, entry["first_blk"], entry["size"], table_size_shift,
+                                  is_contiguous=entry.get("alloc_blocks", 0) > 0, debug=debug)
+            if not raw:
+                continue
+            if dump_raw:
+                (song_dest / "raw").mkdir(parents=True, exist_ok=True)
+                (song_dest / "raw" / entry["name"]).write_bytes(raw)
+            kind = _classify_con_entry(entry["name"])
+            if kind:
+                files[kind] = (entry["name"], raw)
+
+        art_png_info = files.get("art_png")
+        if art_png_info:
+            name, raw = art_png_info
+            try:
+                decode_png_xbox(raw).save(song_dest / "album.png")
+            except Exception as e:
+                dprint(debug, f"Failed to decode album art ({name}): {e}")
+
+        mid_bytes = files.get("mid", (None, None))[1]
+        mogg_bytes = files.get("mogg", (None, None))[1]
+
+        dta_meta = dict(meta)
+        if mid_bytes:
+            for key, value in midi_metadata_from_bytes(mid_bytes, debug).items():
+                dta_meta.setdefault(key, value)
+
+        song_info = _write_con_song_ini(con_path, song_dest, basename, dta_meta)
+        _write_song_assets(song_dest, mid_bytes, mogg_bytes, debug, song_info, cancel_event=cancel_event)
+        results.append(song_dest)
+        now = time.perf_counter()
+        if on_song_done:
+            on_song_done(song_dest, now - t_prev)
+        t_prev = now
+
+    return results
+
 
 def con_extract_to_folder(
     con_path: Path,
@@ -853,9 +1112,22 @@ def con_extract_to_folder(
     debug: bool = False,
     overwrite: bool = False,
     cancel_event: threading.Event | None = None,
-) -> Path:
-    dest_dir = _prepare_con_extraction_folder(con_path, dest_dir, debug, overwrite)
+    on_song_done: Callable[[Path, float], None] | None = None,
+) -> Path | None:
     data = con_path.read_bytes()
+    info = _stfs_parse_header(data, debug)
+    entries = _stfs_list_files(data, info, debug)
+
+    songs_meta = _find_multi_song_dta(entries, data, info["table_size_shift"], debug)
+    if songs_meta:
+        parent = dest_dir or Path(str(con_path) + "_extracted")
+        con_extract_multi_to_folder(con_path, songs_meta, entries, data, info["table_size_shift"],
+                                    dump_raw, parent, debug, overwrite, cancel_event, on_song_done)
+        return parent
+
+    dest_dir = _prepare_con_extraction_folder(con_path, dest_dir, debug, overwrite)
+    if dest_dir is None:
+        return None
     display, files = _extract_stfs_files(data, con_path, dest_dir, debug, dump_raw)
 
     art_png_info = files.get("art_png")
@@ -880,7 +1152,7 @@ def con_extract_to_folder(
     return dest_dir
 
 
-def _prepare_con_extraction_folder(con_path: Path, dest_dir: Path | None, debug: bool, overwrite: bool) -> Path:
+def _prepare_con_extraction_folder(con_path: Path, dest_dir: Path | None, debug: bool, overwrite: bool) -> Path | None:
     if dest_dir is None:
         dest_dir = Path(str(con_path) + "_extracted")
     if dest_dir.exists():
@@ -888,20 +1160,34 @@ def _prepare_con_extraction_folder(con_path: Path, dest_dir: Path | None, debug:
             raise FileExistsError(f"The folder '{dest_dir}' already exists.")
         if _is_extraction_cache_fresh(con_path, dest_dir):
             dprint(debug, "skipping extraction, cache is fresh")
-            return dest_dir
+            return None
     dprint(debug, f"creating folder {dest_dir}")
-    try:
-        if dest_dir.exists() and dest_dir.is_dir():
-            # Iterate over items in reverse order to remove nested files/folders first
-            for item in sorted(dest_dir.rglob("*"), reverse=True):
-                if item.is_file():
-                    item.unlink()
-                elif item.is_dir():
-                    item.rmdir()
-            dest_dir.rmdir()
-    except Exception:
-        raise
+
+    last_exc: Exception | None = None
+    for attempt in range(5):
+        try:
+            if dest_dir.exists() and dest_dir.is_dir():
+                # Iterate over items in reverse order to remove nested files/folders first
+                for item in sorted(dest_dir.rglob("*"), reverse=True):
+                    if item.is_file():
+                        item.unlink()
+                    elif item.is_dir():
+                        item.rmdir()
+                dest_dir.rmdir()
+                time.sleep(1/100)
+            break
+        except (PermissionError, OSError) as e:
+            # Transient on Windows: AV or Explorer thumbnailing briefly locks a
+            # just-written file (e.g. album.png). Wait and retry a few times.
+            last_exc = e
+            dprint(debug, f"folder busy, retrying ({attempt + 1}/5): {e}")
+            time.sleep(0.3 * (attempt + 1))
+    else:
+        if last_exc is not None:
+            raise last_exc
+
     dest_dir.mkdir(parents=True, exist_ok=True)
+    dprint(debug, f"{dest_dir} created")
     return dest_dir
 
 
@@ -925,7 +1211,8 @@ def _extract_stfs_files(data: bytes, con_path: Path, dest_dir: Path, debug: bool
                 continue
 
             if dump_raw:
-                (dest_dir / entry["name"]).write_bytes(raw)
+                (dest_dir / "raw").mkdir(parents=True, exist_ok=True)
+                (dest_dir / "raw" / entry["name"]).write_bytes(raw)
             kind = _classify_con_entry(entry["name"])
 
             if kind is None:
@@ -1023,6 +1310,7 @@ def sng_extract_to_folder(
     debug: bool = False,
     overwrite: bool = False,
     cancel_event: threading.Event | None = None,  # ignored for now
+    on_song_done: Callable[[Path, float], None] | None = None,  # ignored, one song per .sng
 ) -> Path:
     """Extract a .sng container to a folder."""
     dest_dir = _prepare_sng_extraction_folder(sng_path, dest_dir, overwrite, debug)
@@ -1154,6 +1442,7 @@ def pre_extract_all(
     print(bold(f"\nExtracting {len(cons)} CON + {len(sngs)} SNG files..."))
 
     extracted: dict[Path, Path] = {}
+    print_lock = threading.Lock()
     name_width = MAX_SONG_NAME
     executor = ThreadPoolExecutor(max_workers=workers)
     jobs = (
@@ -1161,10 +1450,21 @@ def pre_extract_all(
         [(p, "SNG", sng_extract_to_folder, delete_sngs) for p in sngs]
     )
 
+    def _print_song(pkg_path: Path, song_dest: Path, elapsed: float) -> None:
+        display = f"{pkg_path.name} -> {song_dest.name}" if song_dest.name != pkg_path.name else pkg_path.name
+        display = display[:name_width - 3] + "..." if len(display) > name_width else display
+        padded = f"{display:<{name_width}}"
+        audio_files = find_audio_candidates(song_dest, False)
+        size_mb = sum(f.stat().st_size for f in audio_files) / (1024 * 1024)
+        with print_lock:
+            print(f"{green('ok  ')}  {padded}  song extracted  ({len(audio_files)} audio files, {size_mb:.1f} MB){dim(f'  [{elapsed:.1f}s]')}")
+
     futures = {
         executor.submit(_timed_extract, extract_fn, pkg_path, dump_raw=dump_raw,
                         debug=debug, overwrite=overwrite,
-                        cancel_event=cancel_event): (pkg_path, fmt_label, delete_file)
+                        cancel_event=cancel_event,
+                        on_song_done=lambda song_dest, elapsed, p=pkg_path: _print_song(p, song_dest, elapsed)
+                        ): (pkg_path, fmt_label, delete_file)
         for pkg_path, fmt_label, extract_fn, delete_file in jobs
     }
 
@@ -1184,12 +1484,29 @@ def pre_extract_all(
                 eta_sec = int(avg_time * remaining / workers) if avg_time > 0 and remaining > 0 else 0
                 eta_m, eta_s = divmod(eta_sec, 60)
                 eta_h, eta_m = divmod(eta_m, 60)
-                eta_str = dim(f"  [{eta_h}h{eta_m}m{eta_s:02}s left, {avg_time:.1f}s/file]")
 
-                audio_files = find_audio_candidates(song_folder)
-                size_mb = sum(f.stat().st_size for f in audio_files) / (1024 * 1024)
-                print(f"{green('ok  ')}  {padded}  {fmt_label} extracted  ({len(audio_files)} audio files, {size_mb:.1f} MB){eta_str}  (done {i}/{total})")
-                extracted[pkg_path] = song_folder / "song.ini"
+                # Multi-song CON packs land in subfolders and already printed one
+                # line per song via the on_song_done callback as they finished.
+                is_multi_song = (
+                    fmt_label == "CON" and song_folder.is_dir()
+                    and not (song_folder / "song.ini").exists()
+                    and any(d.is_dir() and (d / "song.ini").exists() for d in song_folder.iterdir())
+                )
+
+                if is_multi_song:
+                    song_subfolders = [d for d in song_folder.iterdir() if d.is_dir() and (d / "song.ini").exists()]
+                    nb_songs_extracted = len(song_subfolders)
+                    eta_str = dim(f"  [{avg_time / nb_songs_extracted:.1f}s/song]")
+                    with print_lock:
+                        print(dim(f"      {pkg_path.name}: {nb_songs_extracted} songs extracted{eta_str}  (done {i}/{total})"))
+                    extracted[pkg_path] = song_subfolders[0] / "song.ini"
+                else:
+                    eta_str = dim(f"  [{eta_h}h{eta_m}m{eta_s:02}s left, {avg_time:.1f}s/file]")
+                    audio_files = find_audio_candidates(song_folder, False)
+                    size_mb = sum(f.stat().st_size for f in audio_files) / (1024 * 1024)
+                    with print_lock:
+                        print(f"{green('ok  ')}  {padded}  {fmt_label} extracted  ({len(audio_files)} audio files, {size_mb:.1f} MB){eta_str}  (done {i}/{total})")
+                    extracted[pkg_path] = song_folder / "song.ini"
 
                 if delete_file and not dry_run:
                     try:

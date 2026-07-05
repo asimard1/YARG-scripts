@@ -4,6 +4,7 @@ This file should be placed directly in the folder of a particular game to work.
 
 from pathlib import Path
 import shutil
+import tqdm
 
 def MoveVideos(path: Path):
     dir_name = path.name
@@ -13,7 +14,7 @@ def MoveVideos(path: Path):
     videos_list = list(path.rglob("*.mp4")) + list(path.rglob("*.webm"))
     print(len(videos_list))
     k = 0
-    for video in videos_list:
+    for video in tqdm.tqdm(videos_list):
         relative_path = str(video).replace(str(path), "")[1:]
         dest_file = videos_dir / relative_path
         dest_dir = dest_file.parent
