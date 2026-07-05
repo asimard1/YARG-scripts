@@ -47,8 +47,11 @@ def moveVideos(path: Path):
     for best_folder in tqdm.tqdm(already_found):
         video_path = already_found[best_folder][0]
         dest_file = best_folder / video_path.name
-        if dest_file.exists:
+        if dest_file.is_file() or dest_file.is_dir():
             print(f"PROBLEM PROBLEM {dest_file} exists")
+            print("Is it a file?:", dest_file.is_file())
+            print("Is it a directory?:", dest_file.is_dir())
+            print("File size in bytes:", dest_file.stat().st_size if dest_file.exists() else "N/A")
             continue
         shutil.move(video_path, best_folder / video_path.name)
 

@@ -55,7 +55,7 @@ SR = 22050           # target sample rate
 AUDIO_CLIP_S = 1800  # max seconds of audio to read (None = unlimited)
 
 # Display / runtime
-MAX_SONG_NAME = 40
+MAX_SONG_NAME = 50
 LIST_PATH = Path(__file__).parent / "yarg_sync_list.json"
 WORKER_THREADS = 6
 ETA_EMA_ALPHA = 0.1
@@ -70,6 +70,8 @@ STEM_CANDIDATES = [
 ]
 STEM_IGNORE = ["preview", "crowd"]
 EXTENSION_LIST = [".ogg", ".opus", ".mp3", ".wav"]
+OTHER_EXTENSIONS = [".ini", ".mid", ".bak", ".webm", ".mp4", ".png"]
+EXCLUDED_CON_SUFFIXES = frozenset(EXTENSION_LIST + OTHER_EXTENSIONS)
 
 # STFS block geometry
 _STFS_BLOCK = 0x1000
@@ -146,7 +148,7 @@ def get_song_list(
     cons = sorted(
         p for p in root.rglob("*")
         if p.is_file()
-        and p.suffix not in EXTENSION_LIST + [".ini", ".mid", ".bak", ".webm", ".mp4", ".png"]
+        and p.suffix not in EXCLUDED_CON_SUFFIXES
         and is_con_file(p)
     )
     sngs = sorted(root.rglob("*.sng"))
@@ -1039,7 +1041,7 @@ def con_extract_multi_to_folder(
     debug: bool = False,
     overwrite: bool = False,
     cancel_event: threading.Event | None = None,
-    on_song_done: Callable[[Path, float], None] | None = None,
+    on_song_done: Callable[[Path, float, int, int], None] | None = None,
 ) -> list[Path]:
     """Extract a multi-song CON pack (e.g. RBN compilation) into one subfolder
     per bundled song under dest_dir. Returns the list of per-song folders."""
@@ -1048,7 +1050,7 @@ def con_extract_multi_to_folder(
     results: list[Path] = []
     t_prev = time.perf_counter()
 
-    for shortname, meta in songs_meta.items():
+    for i, (shortname, meta) in enumerate(songs_meta.items()):
         song_blob = meta.get("song")
         basename = shortname
         if isinstance(song_blob, dict) and isinstance(song_blob.get("name"), str) and song_blob["name"]:
@@ -1057,7 +1059,7 @@ def con_extract_multi_to_folder(
         title = meta.get("name") or basename
         artist = meta.get("artist") or "Unknown Artist"
         folder_name = _sanitize_folder_name(f"{artist} - {title}")
-        song_dest = _prepare_con_extraction_folder(con_path, base_dest / folder_name, debug, overwrite)
+        song_dest = _prepare_con_extraction_folder(con_path, base_dest / folder_name, debug, overwrite, not not i)
         if song_dest is None:
             continue
 
@@ -1099,7 +1101,7 @@ def con_extract_multi_to_folder(
         results.append(song_dest)
         now = time.perf_counter()
         if on_song_done:
-            on_song_done(song_dest, now - t_prev)
+            on_song_done(song_dest, now - t_prev, i + 1, len(songs_meta))
         t_prev = now
 
     return results
@@ -1112,7 +1114,7 @@ def con_extract_to_folder(
     debug: bool = False,
     overwrite: bool = False,
     cancel_event: threading.Event | None = None,
-    on_song_done: Callable[[Path, float], None] | None = None,
+    on_song_done: Callable[[Path, float, int, int], None] | None = None,
 ) -> Path | None:
     data = con_path.read_bytes()
     info = _stfs_parse_header(data, debug)
@@ -1152,12 +1154,23 @@ def con_extract_to_folder(
     return dest_dir
 
 
-def _prepare_con_extraction_folder(con_path: Path, dest_dir: Path | None, debug: bool, overwrite: bool) -> Path | None:
+def _prepare_con_extraction_folder(con_path: Path, dest_dir: Path | None, debug: bool, overwrite: bool,
+                                   create_folder_with_number: bool = False) -> Path | None:
     if dest_dir is None:
         dest_dir = Path(str(con_path) + "_extracted")
     if dest_dir.exists():
         if not overwrite:
-            raise FileExistsError(f"The folder '{dest_dir}' already exists.")
+            print("Should we add a test here?")
+            print(f"I want to create the folder: {dest_dir}")
+            if not create_folder_with_number:
+                raise FileExistsError(f"The folder '{dest_dir}' already exists.")
+            else:
+                dest_dir_temp = dest_dir
+                i = 1
+                while dest_dir_temp.exists():
+                    dest_dir_temp = Path(str(dest_dir) + f"({i})")
+                    i += 1
+                dest_dir = dest_dir_temp
         if _is_extraction_cache_fresh(con_path, dest_dir):
             dprint(debug, "skipping extraction, cache is fresh")
             return None
@@ -1450,20 +1463,36 @@ def pre_extract_all(
         [(p, "SNG", sng_extract_to_folder, delete_sngs) for p in sngs]
     )
 
-    def _print_song(pkg_path: Path, song_dest: Path, elapsed: float) -> None:
+    pack_avg: dict[Path, float] = {}  # pkg_path -> EMA of per-song extraction time, for in-pack ETA
+
+    def _print_song(pkg_path: Path, song_dest: Path, elapsed: float, index: int, total: int) -> None:
         display = f"{pkg_path.name} -> {song_dest.name}" if song_dest.name != pkg_path.name else pkg_path.name
         display = display[:name_width - 3] + "..." if len(display) > name_width else display
         padded = f"{display:<{name_width}}"
         audio_files = find_audio_candidates(song_dest, False)
         size_mb = sum(f.stat().st_size for f in audio_files) / (1024 * 1024)
+
+        avg = pack_avg.get(pkg_path)
+        avg = elapsed if avg is None else avg * (1 - ETA_EMA_ALPHA) + elapsed * ETA_EMA_ALPHA
+        pack_avg[pkg_path] = avg
+
+        remaining = total - index
+        if remaining > 0:
+            eta_sec = int(avg * remaining)
+            eta_m, eta_s = divmod(eta_sec, 60)
+            eta_h, eta_m = divmod(eta_m, 60)
+            suffix = dim(f"  [ETA: {eta_h}h {eta_m:02}m {eta_s:02}s, {elapsed:.1f}s]")
+        else:
+            suffix = dim(f"  [{elapsed:.1f}s]")
+
         with print_lock:
-            print(f"{green('ok  ')}  {padded}  song extracted  ({len(audio_files)} audio files, {size_mb:.1f} MB){dim(f'  [{elapsed:.1f}s]')}")
+            print(f"{green('ok  ')}  {padded}  song extracted  ({len(audio_files)} audio files, {size_mb:.1f} MB){suffix}")
 
     futures = {
         executor.submit(_timed_extract, extract_fn, pkg_path, dump_raw=dump_raw,
                         debug=debug, overwrite=overwrite,
                         cancel_event=cancel_event,
-                        on_song_done=lambda song_dest, elapsed, p=pkg_path: _print_song(p, song_dest, elapsed)
+                        on_song_done=lambda song_dest, elapsed, index, total, p=pkg_path: _print_song(p, song_dest, elapsed, index, total)
                         ): (pkg_path, fmt_label, delete_file)
         for pkg_path, fmt_label, extract_fn, delete_file in jobs
     }
