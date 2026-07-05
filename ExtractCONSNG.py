@@ -238,15 +238,15 @@ def _stfs_read_file(data: bytes, first_block: int, file_size: int,
 
     if dbg_name:
         flag = " [CROSSED 0xAA BOUNDARY]" if crossed_boundary else ""
-        print(f"[stfs-read] {dbg_name}: first_blk={first_block:#x} "
+        dprint(debug, f"[stfs-read] {dbg_name}: first_blk={first_block:#x} "
               f"want={file_size} got={len(out)}{flag}")
 
     return bytes(out)
 
 
-def _debug_check_mid(name: str, raw: bytes) -> None:
+def _debug_check_mid(name: str, raw: bytes, debug: bool = False) -> None:
     ok = raw[:4] == b"MThd"
-    print(f"[mid-check] {name}: {'OK' if ok else 'BAD HEADER'} "
+    dprint(debug, f"[mid-check] {name}: {'OK' if ok else 'BAD HEADER'} "
           f"({len(raw)} bytes, starts {raw[:8]!r})")
 
 
@@ -1120,7 +1120,7 @@ def con_extract_multi_to_folder(
                 (song_dest / "raw" / entry["name"]).write_bytes(raw)
             kind = _classify_con_entry(entry["name"])
             if kind == "mid":
-                _debug_check_mid(f"{basename}/{entry['name']}", raw)
+                _debug_check_mid(f"{basename}/{entry['name']}", raw, debug)
             if kind:
                 _set_kind_with_priority(files, kind, entry["name"], raw, basename)
 
@@ -1279,7 +1279,7 @@ def _extract_stfs_files(data: bytes, con_path: Path, dest_dir: Path, debug: bool
                 (dest_dir / "raw" / entry["name"]).write_bytes(raw)
             kind = _classify_con_entry(entry["name"])
             if kind == "mid":
-                _debug_check_mid(entry["name"], raw)
+                _debug_check_mid(entry["name"], raw, debug)
 
             if kind is None:
                 if not any(entry["name"].lower().endswith(ext) for ext in _CON_KNOWN_IGNORED):
