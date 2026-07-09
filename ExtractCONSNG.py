@@ -11,6 +11,7 @@ os.environ.update({
 try:
     import subprocess
     import io
+    import json
     import argparse
     import re
     import struct
@@ -821,9 +822,13 @@ def _split_mogg(
     }
 
     stem_names: dict[int, str | None] = {}
+    stem_channels: dict[int, list[int]] = {}
     assigned_channels: set[int] = set()
 
-    # Parse DTA-style tracks
+    # Parse DTA-style tracks. Each entry can be either an int (single channel,
+    # e.g. {"bass": 6}) or a dict wrapping a channel list (e.g. {"drum":
+    # {"_values": [[0,1,2,3,4,5]]}}). A bad entry should be skipped, not
+    # abort parsing of the rest of the track list.
     try:
         if song_info:
             tracks = (song_info.get("tracks") or {}).get("_values")
@@ -836,21 +841,33 @@ def _split_mogg(
                     if not name:
                         continue
 
-                    raw = entry[name].get("_values", [])
-                    channels = []
-                    if raw and isinstance(raw[0], list):
-                        channels = raw[0]
-                    elif isinstance(raw, list):
-                        channels = raw
+                    try:
+                        value = entry[name]
+                        if isinstance(value, int):
+                            channels = [value]
+                        elif isinstance(value, dict):
+                            raw = value.get("_values", [])
+                            if raw and isinstance(raw[0], list):
+                                channels = raw[0]
+                            elif isinstance(raw, list):
+                                channels = raw
+                            else:
+                                channels = []
+                        else:
+                            channels = []
 
-                    if not isinstance(channels, list):
+                        if not isinstance(channels, list) or not channels:
+                            continue
+
+                        stem_name = TEMP_STEM_NAMES.get(name, name)
+                        stem_names[i] = stem_name
+                        stem_channels[i] = channels
+                        for c in channels:
+                            if isinstance(c, int):
+                                assigned_channels.add(c)
+                    except Exception as e:
+                        dprint(debug, f"DTA parse error for {name!r}: {e}")
                         continue
-
-                    stem_name = TEMP_STEM_NAMES.get(name, name)
-                    stem_names[i] = stem_name
-                    for c in channels:
-                        if isinstance(c, int):
-                            assigned_channels.add(c)
 
     except Exception as e:
         dprint(debug, f"DTA parse error: {e}")
@@ -891,14 +908,7 @@ def _split_mogg(
 
     # Build stems from DTA
     for idx, name in stem_names.items():
-        channels = []
-        try:
-            assert song_info is not None
-            entry = song_info["tracks"]["_values"][0][idx][name]["_values"][0]
-            channels = entry if isinstance(entry, list) else []
-        except Exception:
-            channels = []
-
+        channels = stem_channels.get(idx, [])
         if not channels:
             continue
 
@@ -1092,6 +1102,8 @@ def con_extract_multi_to_folder(
     t_prev = time.perf_counter()
 
     for i, (shortname, meta) in enumerate(songs_meta.items()):
+        # if shortname not in ["warpigs", "youshookme_live", "youngerbums"]:
+        #     continue
         song_blob = meta.get("song")
         basename = shortname
         if isinstance(song_blob, dict) and isinstance(song_blob.get("name"), str) and song_blob["name"]:
@@ -1142,6 +1154,7 @@ def con_extract_multi_to_folder(
 
         song_info = _write_con_song_ini(con_path, song_dest, basename, dta_meta)
         _write_song_assets(song_dest, mid_bytes, mogg_bytes, debug, song_info, cancel_event=cancel_event)
+        (song_dest / ".extraction_complete").touch()
         results.append(song_dest)
         now = time.perf_counter()
         if on_song_done:
@@ -1195,6 +1208,7 @@ def con_extract_to_folder(
 
     song_info = _write_con_song_ini(con_path, dest_dir, display, dta_meta)
     _write_song_assets(dest_dir, mid_bytes, mogg_bytes, debug, song_info, cancel_event=cancel_event)
+    (dest_dir / ".extraction_complete").touch()
     return dest_dir
 
 
@@ -1202,10 +1216,10 @@ def _prepare_con_extraction_folder(con_path: Path, dest_dir: Path | None, debug:
                                    create_folder_with_number: bool = False) -> Path | None:
     if dest_dir is None:
         dest_dir = Path(str(con_path) + "_extracted")
-    try:
-        print("stat:", dest_dir.stat())
-    except Exception as e:
-        print("stat failed:", e)
+    # try:
+    #     print("stat:", dest_dir.stat())
+    # except Exception as e:
+    #     print("stat failed:", e)
     if dest_dir.exists():
         if not overwrite:
             print("Should we add a test here?")
@@ -1320,6 +1334,13 @@ def _write_song_assets(dest_dir: Path, mid_bytes: bytes | None, mogg_bytes: byte
 
 
 def _write_con_song_ini(con_path: Path, dest_dir: Path, display: str, dta_meta: dict) -> dict | None:
+    try:
+        (dest_dir / "dta_meta_debug.json").write_text(
+            json.dumps(dta_meta, indent=2, default=str), encoding="utf-8"
+        )
+    except Exception:
+        pass
+
     con_parts = con_path.name.split(" - ")
     default_artist = con_parts[0] if len(con_parts) > 0 else "Unknown Artist"
     default_name = con_parts[-1] if len(con_parts) > 1 else display
@@ -1359,9 +1380,15 @@ def _write_con_song_ini(con_path: Path, dest_dir: Path, display: str, dta_meta: 
             continue
         extra[key_change.get(key, key)] = value
 
-    song_blob = dta_meta.get("song")
-    if isinstance(song_blob, dict):
-        extra.setdefault("vocal_parts", song_blob.get("vocal_parts"))
+    # song_blob = dta_meta.get("song")
+    # if isinstance(song_blob, dict):
+    #     extra.setdefault("vocal_parts", song_blob.get("vocal_parts"))
+    #     try:
+    #         (dest_dir / "song_debug.json").write_text(
+    #             json.dumps(song_blob, indent=2, default=str), encoding="utf-8"
+    #         )
+    #     except Exception:
+    #         pass
 
     _write_song_ini(dest_dir, name, artist, extra)
     return extra.get("song")
@@ -1423,6 +1450,7 @@ def sng_extract_to_folder(
     pos += 8  # skip FileData section-length field
     _extract_sng_files(data, xor_mask, file_metas, dest_dir, debug)
     _write_sng_song_ini(sng_path, dest_dir, metadata, debug)
+    (dest_dir / ".extraction_complete").touch()
     return dest_dir
 
 
@@ -1608,12 +1636,29 @@ def pre_extract_all(
         for fut, (pkg_path, fmt_label, delete_file) in futures.items():
             dest_dir = Path(str(pkg_path) + "_extracted")
             if dest_dir.exists() and not _is_extraction_cache_fresh(pkg_path, dest_dir):
-                shutil.rmtree(dest_dir)
+                _cleanup_interrupted_extraction(dest_dir)
         raise
     else:
         executor.shutdown(wait=True)
 
     return extracted
+
+
+def _cleanup_interrupted_extraction(dest_dir: Path) -> None:
+    """On interrupt, only remove unfinished songs. Completion is marked by
+    .extraction_complete, written only after assets/stems are fully done —
+    song.ini alone isn't proof, since it's written before the stems."""
+    if (dest_dir / ".extraction_complete").exists():
+        return  # single-song, already complete
+
+    subfolders = [d for d in dest_dir.iterdir() if d.is_dir()]
+    if not subfolders:
+        shutil.rmtree(dest_dir)  # single-song, still incomplete
+        return
+
+    for d in subfolders:  # multi-song: remove only unfinished songs
+        if not (d / ".extraction_complete").exists():
+            shutil.rmtree(d)
 
 
 def process_library(

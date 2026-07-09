@@ -107,6 +107,8 @@ STEM_CANDIDATES = [
 ]
 STEM_IGNORE = ["preview", "crowd"]
 EXTENSION_LIST = [".ogg", ".opus", ".mp3", ".wav"]
+OTHER_EXTENSIONS = [".ini", ".mid", ".bak", ".webm", ".mp4", ".png"]
+EXCLUDED_CON_SUFFIXES = frozenset(EXTENSION_LIST + OTHER_EXTENSIONS)
 
 # STFS block geometry
 _STFS_BLOCK = 0x1000
@@ -281,7 +283,9 @@ def get_song_list(
 
     cons = sorted(
         p for p in root.rglob("*")
-        if p.is_file() and ExtractCONSNG.is_con_file(p)
+        if p.is_file()
+        and p.suffix not in EXCLUDED_CON_SUFFIXES
+        and ExtractCONSNG.is_con_file(p)
     )
     sngs = sorted(root.rglob("*.sng"))
 
@@ -1605,13 +1609,14 @@ def process_library(
             songs = [p for p in songs if song_key(p, skip_existing_inconclusive=True, skip_existing_clustered=True) not in existing]
         # Recompute per-type counts from the filtered list
         inis = [p for p in songs if p.suffix == ".ini"]
-        cons  = [p for p in songs if ExtractCONSNG.is_con_file(p)]
+        cons  = [p for p in songs if p.suffix not in EXCLUDED_CON_SUFFIXES and ExtractCONSNG.is_con_file(p)]
         sngs  = [p for p in songs if p.suffix == ".sng"]
         print(bold(f"{tag}After filtering existing entries, {len(songs)} songs remain to process"))
     else:
         songs = all_songs
 
     cancel_event = threading.Event()
+    extracted_map = {}
     if extract:
         extracted_map = ExtractCONSNG.pre_extract_all(cons, sngs, overwrite, debug, workers, cancel_event, delete_cons, delete_sngs, dry_run, dump_raw)
     if extract_only:
@@ -1619,8 +1624,7 @@ def process_library(
 
     # Replace CON/SNG paths with their extracted ini paths
     songs = [
-        extracted_map[p] if p in extracted_map else p
-        for p in songs
+        extracted_map.get(p) if p in extracted_map else p for p in songs
         if not (ExtractCONSNG.is_con_file(p) or ExtractCONSNG.is_sng_file(p)) or p in extracted_map
     ]
 

@@ -8,24 +8,28 @@ def moveVideos(path: Path):
     video_source_dir = path / (path.name + " Videos")
     if not video_source_dir.exists():
         return
-    print(f"Getting videos from {video_source_dir}")
-    videos_list = list(video_source_dir.rglob("*.mp4")) + list(video_source_dir.rglob("*.webm"))
+    print(f"Getting videos from {video_source_dir}.")
+    videos_list = sorted(list(video_source_dir.rglob("*.mp4")) + list(video_source_dir.rglob("*.webm")))
     already_found = {}
-    for video in tqdm.tqdm(videos_list):
-        video_folder = video.parent
-        song_name = video_folder.name.replace("_extracted", "")
-        # print(song_name)
+    potential_dest_list = sorted([file for file in path.rglob("*") if file.is_dir() and str(video_source_dir) not in str(file)])
+    print(f"Checking {len(videos_list)} videos against {len(potential_dest_list)} folders.")
+    print("Finding best fits...")
+    for video in tqdm.tqdm(videos_list): # Finding fits
+        song_name = video.parent.name.replace("_extracted", "")
+        folder_name = video.parent.parent.name.replace("_extracted", "")
+        processed_name = folder_name + " - " + song_name + (f" - {video.stem}" if not video.name.lower().startswith("video.") else "")
 
         best_sim = 0
-        k = 0
         best_folder = ""
-        extracted_list = [file for file in path.rglob("*") if file.is_dir() and str(video_source_dir) not in str(file)]
-        for extracted_folder in extracted_list:
-            similarity = SequenceMatcher(None, song_name, extracted_folder.name).ratio()
+        lines = []
+        for potential_dest in potential_dest_list:
+            processed_potential = f"{potential_dest.parent.name} - {potential_dest.name}"
+            similarity = SequenceMatcher(None, processed_name, processed_potential).ratio()
+            lines.append(f"{processed_name} -> {processed_potential}, {similarity:.3f}")
             # print(song_name, extracted_folder.name, similarity)
-            if similarity > best_sim and not (extracted_folder / video.name).exists():
+            if similarity > best_sim and not (potential_dest / video.name).exists():
                 best_sim = similarity
-                best_folder = extracted_folder
+                best_folder = potential_dest
         if best_folder in already_found or best_folder == "":
             current_video = f"{video.parent.name}\\{video.name}"
             recorded = already_found[best_folder]
@@ -41,10 +45,17 @@ def moveVideos(path: Path):
             if best_sim < recorded_sim:
                 # We don't want to replace
                 continue
+        print(f"\n\n{processed_name} -> {best_folder.name}")
+        # for line in lines:
+        #     line_str = line + (" (chosen)" if f"{best_folder.parent.name} - {best_folder.name}" in line else "")
+        #     print(line_str)
         if best_folder in already_found:
             print("Replacing...")
         already_found[best_folder] = [video, best_sim]
-    for best_folder in tqdm.tqdm(already_found):
+
+    print("Moving video around...")
+    k = 0
+    for best_folder in tqdm.tqdm(already_found): # Moving videos
         video_path = already_found[best_folder][0]
         dest_file = best_folder / video_path.name
         if dest_file.is_file() or dest_file.is_dir():
@@ -53,15 +64,11 @@ def moveVideos(path: Path):
             print("Is it a directory?:", dest_file.is_dir())
             print("File size in bytes:", dest_file.stat().st_size if dest_file.exists() else "N/A")
             continue
-        shutil.move(video_path, best_folder / video_path.name)
+        # shutil.move(video_path, best_folder / video_path.name)
+        k += 1
+    print(f"Moved {k} videos.")
 
-    # printed = False
-    # for extracted in extracted_list:
-    #     if extracted not in already_found:
-    #         if not printed:
-    #             print("Need to check the following:")
-    #             printed = True
-    #         print(extracted)
+
     print("\n")
 
 if __name__ == "__main__":
