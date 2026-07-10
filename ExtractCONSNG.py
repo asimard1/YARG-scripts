@@ -744,6 +744,25 @@ def decode_png_xbox(raw: bytes):
 
 # --- MOGG audio splitting (ffmpeg stem separation) ---
 
+import math
+
+
+def _db_to_gain(db: float) -> float:
+    return math.pow(10.0, db / 20.0)
+
+
+def _pan_coefficients(pan: float) -> tuple[float, float]:
+    """
+    Rock Band pan:
+        -1 = full left
+         0 = center
+         1 = full right
+    """
+    pan = max(-1.0, min(1.0, float(pan)))
+    left = (1.0 - pan) / 2.0
+    right = (1.0 + pan) / 2.0
+    return left, right
+
 def _split_mogg(
     mogg_bytes: bytes,
     dest_dir: Path,
@@ -825,6 +844,9 @@ def _split_mogg(
     stem_channels: dict[int, list[int]] = {}
     assigned_channels: set[int] = set()
 
+    channel_vols = [0.0] * n_ch
+    channel_pans = [0.0] * n_ch
+
     # Parse DTA-style tracks. Each entry can be either an int (single channel,
     # e.g. {"bass": 6}) or a dict wrapping a channel list (e.g. {"drum":
     # {"_values": [[0,1,2,3,4,5]]}}). A bad entry should be skipped, not
@@ -868,9 +890,28 @@ def _split_mogg(
                     except Exception as e:
                         dprint(debug, f"DTA parse error for {name!r}: {e}")
                         continue
-
     except Exception as e:
         dprint(debug, f"DTA parse error: {e}")
+
+    try:
+        if song_info:
+            vols = song_info.get("vols")
+            if isinstance(vols, dict):
+                raw = vols.get("_values", [])
+                if raw and isinstance(raw[0], list):
+                    values = raw[0]
+                    for i, value in enumerate(values[:n_ch]):
+                        channel_vols[i] = float(value)
+
+            pans = song_info.get("pans")
+            if isinstance(pans, dict):
+                raw = pans.get("_values", [])
+                if raw and isinstance(raw[0], list):
+                    values = raw[0]
+                    for i, value in enumerate(values[:n_ch]):
+                        channel_pans[i] = float(value)
+    except Exception as e:
+        dprint(debug, f"Failed reading pans/vols: {e}")
 
     # Any unassigned channels become "backing"
     unassigned = [c for c in range(n_ch) if c not in assigned_channels]
@@ -883,21 +924,53 @@ def _split_mogg(
     # Build ffmpeg filter graph
     filter_parts = []
 
-    left_channels = "+".join(f"c{c}" for c in range(0, n_ch, 2))
-    right_channels = "+".join(f"c{c}" for c in range(1, n_ch, 2))
+    left_terms = []
+    right_terms = []
+
+    for ch in range(n_ch):
+        gain = _db_to_gain(channel_vols[ch])
+        left_pan, right_pan = _pan_coefficients(channel_pans[ch])
+
+        if left_pan:
+            left_terms.append(f"{gain * left_pan:.6f}*c{ch}")
+
+        if right_pan:
+            right_terms.append(f"{gain * right_pan:.6f}*c{ch}")
+
+    left_expr = "+".join(left_terms) or "0"
+    right_expr = "+".join(right_terms) or "0"
 
     filter_parts.append(
-        f"[0:a]pan=stereo|c0={left_channels}|c1={right_channels}[mix]"
+        f"[0:a]pan=stereo|c0={left_expr}|c1={right_expr}[mix]"
     )
 
     def _pan(channels: list[int], label: str) -> str:
-        if len(channels) == 1:
-            return f"[0:a]pan=mono|c0=c{channels[0]}[{label}]"
-        if len(channels) == 2:
-            return f"[0:a]pan=stereo|c0=c{channels[0]}|c1=c{channels[1]}[{label}]"
-        left = "+".join(f"c{c}" for c in channels[::2])
-        right = "+".join(f"c{c}" for c in channels[1::2])
-        return f"[0:a]pan=stereo|c0={left}|c1={right}[{label}]"
+        left_terms = []
+        right_terms = []
+
+        for ch in channels:
+            gain = _db_to_gain(channel_vols[ch])
+            left_pan, right_pan = _pan_coefficients(channel_pans[ch])
+
+            if left_pan:
+                left_terms.append(f"{gain * left_pan:.6f}*c{ch}")
+
+            if right_pan:
+                right_terms.append(f"{gain * right_pan:.6f}*c{ch}")
+
+        if not right_terms:
+            return (
+                f"[0:a]pan=mono|"
+                f"c0={'+'.join(left_terms) or '0*c0'}"
+                f"[{label}]"
+            )
+
+        return (
+            f"[0:a]pan=stereo|"
+            f"c0={'+'.join(left_terms) or '0*c0'}|"
+            f"c1={'+'.join(right_terms) or '0*c0'}"
+            f"[{label}]"
+        )
 
     output_args = [
         "-map", "[mix]",
@@ -976,10 +1049,15 @@ def _split_mogg(
 
 # --- song.ini writing & extraction-cache helpers ---
 
-def _write_song_ini(dest_dir: Path, name: str, artist: str, extra: dict) -> None:
+def _write_song_ini(dest_dir: Path, name: str, artist: str, extra: dict,
+                     shortname: str | None = None, dtaname: str | None = None) -> None:
     """Write song.ini from extracted metadata, skipping numeric-only keys and reserved fields."""
-    SKIP_KEYS = {"name", "title", "artist", "delay", "song"}
+    SKIP_KEYS = {"name", "title", "artist", "delay", "song", "shortname", "dtaname"}
     lines = ["[song]", f"name = {name}", f"artist = {artist}", "delay = 0"]
+    if shortname:
+        lines.append(f"shortname = {shortname}")
+    if dtaname:
+        lines.append(f"dtaname = {dtaname}")
     lines += [f"{key} = {value}" for key, value in extra.items()
               if not str(key).isdigit() and key not in SKIP_KEYS]
     if not dest_dir.exists():
@@ -1152,7 +1230,8 @@ def con_extract_multi_to_folder(
             for key, value in midi_metadata_from_bytes(mid_bytes, debug).items():
                 dta_meta.setdefault(key, value)
 
-        song_info = _write_con_song_ini(con_path, song_dest, basename, dta_meta)
+        # in con_extract_multi_to_folder (~line 1228):
+        song_info = _write_con_song_ini(con_path, song_dest, basename, dta_meta, dtaname=shortname, dump_raw=dump_raw, debug=debug)
         _write_song_assets(song_dest, mid_bytes, mogg_bytes, debug, song_info, cancel_event=cancel_event)
         (song_dest / ".extraction_complete").touch()
         results.append(song_dest)
@@ -1199,14 +1278,15 @@ def con_extract_to_folder(
         except Exception as e:
             dprint(debug, f"Failed to decode album art ({name}): {e}")
 
-    dta_meta = _load_dta_metadata(files, debug)
+    # in con_extract_to_folder (~line 1275-1282):
+    dtaname, dta_meta = _load_dta_metadata(files, debug)
     mid_bytes, mogg_bytes = _load_song_assets(data, files, debug)
 
     if mid_bytes:
         for key, value in midi_metadata_from_bytes(mid_bytes, debug).items():
             dta_meta.setdefault(key, value)
 
-    song_info = _write_con_song_ini(con_path, dest_dir, display, dta_meta)
+    song_info = _write_con_song_ini(con_path, dest_dir, display, dta_meta, dtaname=dtaname, dump_raw=dump_raw, debug=debug)
     _write_song_assets(dest_dir, mid_bytes, mogg_bytes, debug, song_info, cancel_event=cancel_event)
     (dest_dir / ".extraction_complete").touch()
     return dest_dir
@@ -1309,11 +1389,15 @@ def _extract_stfs_files(data: bytes, con_path: Path, dest_dir: Path, debug: bool
     return display, files
 
 
-def _load_dta_metadata(files: dict, debug: bool) -> dict:
+def _load_dta_metadata(files: dict, debug: bool) -> tuple[str | None, dict]:
     dta_bytes = files.get("dta", (None, None))[1]
     if not dta_bytes:
-        return {}
-    return _parse_songs_dta(dta_bytes.decode("utf-8", errors="ignore"))
+        return None, {}
+    grouped = _parse_songs_dta_grouped(dta_bytes.decode("utf-8", errors="ignore"))
+    if not grouped:
+        return None, {}
+    dtaname, meta = next(iter(grouped.items()))
+    return dtaname, meta
 
 
 def _load_song_assets(data: bytes, files: dict, debug: bool) -> tuple[bytes | None, bytes | None]:
@@ -1333,13 +1417,16 @@ def _write_song_assets(dest_dir: Path, mid_bytes: bytes | None, mogg_bytes: byte
         _split_mogg(mogg_bytes, dest_dir, debug, song_info=song_info, cancel_event=cancel_event)
 
 
-def _write_con_song_ini(con_path: Path, dest_dir: Path, display: str, dta_meta: dict) -> dict | None:
-    try:
-        (dest_dir / "dta_meta_debug.json").write_text(
-            json.dumps(dta_meta, indent=2, default=str), encoding="utf-8"
-        )
-    except Exception:
-        pass
+def _write_con_song_ini(con_path: Path, dest_dir: Path, display: str, dta_meta: dict,
+                        dtaname: str | None = None,
+                        dump_raw: bool = False, debug: bool = False) -> dict | None:
+    if dump_raw and debug:
+        try:
+            (dest_dir / "dta_meta_debug.json").write_text(
+                json.dumps(dta_meta, indent=2, default=str), encoding="utf-8"
+            )
+        except Exception:
+            pass
 
     con_parts = con_path.name.split(" - ")
     default_artist = con_parts[0] if len(con_parts) > 0 else "Unknown Artist"
@@ -1348,8 +1435,13 @@ def _write_con_song_ini(con_path: Path, dest_dir: Path, display: str, dta_meta: 
     name = dta_meta.get("name") or dta_meta.get("title") or default_name
     name = str(name)
     if "/" in name:
-        name = default_name  # Small fallback just in case
+        name = default_name
     artist = dta_meta.get("artist") or default_artist
+
+    song_blob = dta_meta.get("song")
+    shortname = None
+    if isinstance(song_blob, dict) and isinstance(song_blob.get("name"), str) and song_blob["name"]:
+        shortname = "/".join(song_blob["name"].split("/")[2:])
 
     key_change = {
         "year_released": "year", "album_name": "album", "author": "charter",
@@ -1370,8 +1462,6 @@ def _write_con_song_ini(con_path: Path, dest_dir: Path, display: str, dta_meta: 
                     if instrument in STEM_CANDIDATES:
                         try:
                             rank = int(rank_val)
-                            # Map CON rank (1..1000) → YARG difficulty (0..16)
-                            # f(1)=0, f(500)=8, f(999)=15, f(1000)=16
                             n = 1000; m = (n-2)/15; k = -m/2+2
                             diff = max(0, min(16, round((rank-k)/m)))
                             extra[f"diff_{instrument}"] = diff
@@ -1380,17 +1470,7 @@ def _write_con_song_ini(con_path: Path, dest_dir: Path, display: str, dta_meta: 
             continue
         extra[key_change.get(key, key)] = value
 
-    # song_blob = dta_meta.get("song")
-    # if isinstance(song_blob, dict):
-    #     extra.setdefault("vocal_parts", song_blob.get("vocal_parts"))
-    #     try:
-    #         (dest_dir / "song_debug.json").write_text(
-    #             json.dumps(song_blob, indent=2, default=str), encoding="utf-8"
-    #         )
-    #     except Exception:
-    #         pass
-
-    _write_song_ini(dest_dir, name, artist, extra)
+    _write_song_ini(dest_dir, name, artist, extra, shortname=shortname, dtaname=dtaname)
     return extra.get("song")
 
 

@@ -15,18 +15,20 @@ def moveVideos(path: Path):
     print(f"Checking {len(videos_list)} videos against {len(potential_dest_list)} folders.")
     print("Finding best fits...")
     for video in tqdm.tqdm(videos_list): # Finding fits
-        song_name = video.parent.name.replace("_extracted", "")
-        folder_name = video.parent.parent.name.replace("_extracted", "")
+        song_name = video.parent.name
+        folder_name = video.parent.parent.name
         processed_name = folder_name + " - " + song_name + (f" - {video.stem}" if not video.name.lower().startswith("video.") else "")
+        processed_name = processed_name.replace("_extracted", "")
 
         best_sim = 0
         best_folder = ""
         lines = []
         for potential_dest in potential_dest_list:
             processed_potential = f"{potential_dest.parent.name} - {potential_dest.name}"
+            processed_potential = processed_potential.replace("_extracted", "")
             similarity = SequenceMatcher(None, processed_name, processed_potential).ratio()
+            # print(processed_name, processed_potential, similarity)
             lines.append(f"{processed_name} -> {processed_potential}, {similarity:.3f}")
-            # print(song_name, extracted_folder.name, similarity)
             if similarity > best_sim and not (potential_dest / video.name).exists():
                 best_sim = similarity
                 best_folder = potential_dest
@@ -45,7 +47,7 @@ def moveVideos(path: Path):
             if best_sim < recorded_sim:
                 # We don't want to replace
                 continue
-        print(f"\n\n{processed_name} -> {best_folder.name}")
+        # print(f"\n\n{processed_name} -> {best_folder.name}")
         # for line in lines:
         #     line_str = line + (" (chosen)" if f"{best_folder.parent.name} - {best_folder.name}" in line else "")
         #     print(line_str)
@@ -64,7 +66,7 @@ def moveVideos(path: Path):
             print("Is it a directory?:", dest_file.is_dir())
             print("File size in bytes:", dest_file.stat().st_size if dest_file.exists() else "N/A")
             continue
-        # shutil.move(video_path, best_folder / video_path.name)
+        shutil.move(video_path, best_folder / video_path.name)
         k += 1
     print(f"Moved {k} videos.")
 
