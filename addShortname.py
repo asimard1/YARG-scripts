@@ -1,14 +1,21 @@
 from pathlib import Path
 import json
 import time
+import tqdm
 
 def scanDir(root: Path):
-    songs_updates = [f.name for f in (root / 'songs_updates').rglob("*") if f.is_dir()]
-    # print(songs_updates)
-    inUpdates = 0
+    songs_updates_dir = list(root.rglob("songs_updates"))[0]
+    songs_updates = [f.name for f in songs_updates_dir.rglob("*") if f.is_dir()]
+    print(len(songs_updates))
+
+    inUpdatesRB1 = 0
+    inUpdatesRB2 = 0
+    inUpdatesRB3 = 0
+    inUpdatesOther = 0
     notInUpdates = 0
     updated = 0
-    for dta_meta_debug in root.rglob("dta_meta_debug.json"):
+    toUpdate = list(root.rglob("dta_meta_debug.json"))
+    for dta_meta_debug in tqdm.tqdm(toUpdate):
         with open(dta_meta_debug, 'r', encoding='utf-8') as file:
             dta_meta_debug_dict = json.load(file)
         try:
@@ -20,7 +27,14 @@ def scanDir(root: Path):
         try:
             assert shortname in songs_updates
             # print(f"HAPPY HAPPY In updates: {shortname} ------------")
-            inUpdates += 1
+            if '13.' in str(dta_meta_debug):
+                inUpdatesRB1 += 1
+            elif '14.' in str(dta_meta_debug):
+                inUpdatesRB2 += 1
+            elif '18.' in str(dta_meta_debug):
+                inUpdatesRB3 += 1
+            else:
+                inUpdatesOther += 1
         except:
             # print(f"Not in updates: {shortname}")
             notInUpdates += 1
@@ -79,7 +93,7 @@ def scanDir(root: Path):
         with open(iniPath, 'w', encoding='utf-8') as f:
             f.writelines(lines)
 
-    print(f"Have updates: {inUpdates}, don't have updates: {notInUpdates}.")
+    print(f"Have updates: {inUpdatesRB1}, {inUpdatesRB2}, {inUpdatesRB3}, {inUpdatesOther}, don't have updates: {notInUpdates}.")
     print(f"Updated ini files: {updated}.")
 
 

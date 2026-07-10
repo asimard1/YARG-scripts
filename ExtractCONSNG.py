@@ -1174,11 +1174,17 @@ def con_extract_multi_to_folder(
 ) -> list[Path]:
     """Extract a multi-song CON pack (e.g. RBN compilation) into one subfolder
     per bundled song under dest_dir. Returns the list of per-song folders."""
+    print(f"Found files: {[e.get('name') for e in entries]}")
+    # for e in entries:
+    #     name = e["name"]
+    #     if not name.endswith((".bin", ".mid", ".mogg", ".usr", ".vnn", ".voc", ".xvocab")):
+    #         print(e["name"])
     base_dest = dest_dir or Path(str(con_path) + "_extracted")
     base_dest.mkdir(parents=True, exist_ok=True)
     results: list[Path] = []
     t_prev = time.perf_counter()
 
+    print(f"Songs metadata: {songs_meta}")
     for i, (shortname, meta) in enumerate(songs_meta.items()):
         # if shortname not in ["warpigs", "youshookme_live", "youngerbums"]:
         #     continue
@@ -1256,6 +1262,7 @@ def con_extract_to_folder(
     info = _stfs_parse_header(data, debug)
     entries = _stfs_list_files(data, info, debug)
 
+    # For RB1 export, entries is missing all the png stuff
     songs_meta = _find_multi_song_dta(entries, data, info["table_size_shift"], debug)
     if songs_meta:
         parent = dest_dir or Path(str(con_path) + "_extracted")
@@ -1266,7 +1273,7 @@ def con_extract_to_folder(
     dest_dir = _prepare_con_extraction_folder(con_path, dest_dir, debug, overwrite)
     if dest_dir is None:
         return None
-    display, files = _extract_stfs_files(data, con_path, dest_dir, debug, dump_raw)
+    display, files = _extract_stfs_files(data, entries, con_path, dest_dir, debug, dump_raw)
 
     art_png_info = files.get("art_png")
     if art_png_info:
@@ -1348,13 +1355,12 @@ def _prepare_con_extraction_folder(con_path: Path, dest_dir: Path | None, debug:
     return dest_dir
 
 
-def _extract_stfs_files(data: bytes, con_path: Path, dest_dir: Path, debug: bool, dump_raw: bool) -> tuple[str, dict[str, tuple[str, bytes]]]:
+def _extract_stfs_files(data: bytes, entries: list, con_path: Path, dest_dir: Path, debug: bool, dump_raw: bool) -> tuple[str, dict[str, tuple[str, bytes]]]:
     files: dict[str, tuple[str, bytes]] = {}
     display = con_path.stem
     try:
         info = _stfs_parse_header(data, debug)
         display = info.get("display_name") or con_path.stem
-        entries = _stfs_list_files(data, info, debug)
 
         for entry in entries:
             if entry["is_dir"] or entry["size"] == 0:
@@ -1448,6 +1454,9 @@ def _write_con_song_ini(con_path: Path, dest_dir: Path, display: str, dta_meta: 
         "preview_start": "preview_start_time", "preview_end": "preview_end_time",
         "album_track_number": "album_track", "game_origin": "icon",
     }
+    instrum_change = {
+        "drum": "drums"
+    }
 
     extra = {}
     for key, value in dta_meta.items():
@@ -1461,10 +1470,13 @@ def _write_con_song_ini(con_path: Path, dest_dir: Path, display: str, dta_meta: 
                 for instrument, rank_val in value.items():
                     if instrument in STEM_CANDIDATES:
                         try:
+                            instrument_name = instrument
+                            if instrument in instrum_change:
+                                instrument_name = instrum_change[instrument]
                             rank = int(rank_val)
                             n = 1000; m = (n-2)/15; k = -m/2+2
                             diff = max(0, min(16, round((rank-k)/m)))
-                            extra[f"diff_{instrument}"] = diff
+                            extra[f"diff_{instrument_name}"] = diff
                         except (TypeError, ValueError):
                             pass
             continue
