@@ -25,6 +25,7 @@ try:
     from PIL import Image
     import texture2ddecoder
     import numpy as np
+    import math
 except ImportError as e:
     pkg = str(e).split("'")[-2] if "'" in str(e) else "required dependencies"
     print(f"Error: Could not import {pkg}.")
@@ -37,27 +38,8 @@ except ImportError as e:
 
 # --- Constants ---
 
-# Delay search
-MAX_DELAY_MS = 100     # initial search range (ms)
-COARSE_STEP = 3        # coarse scan spacing before fine refinement
-FINE_STEP = 1          # fine scan spacing
-EXTEND_LIMIT = 5       # can extend to ±(EXTEND_LIMIT × MAX_DELAY_MS)
-TOLERANCE_MS = 15      # onset match window (ms) — overridden by --tolerance
-SOFT_SCORE_POWER = 2   # parameter to control the shape of the soft score curve
-HOP_LENGTH = 512       # librosa hop length for onset detection — overridden by --hop-length
-BOUNDARY_BONUS = False # whether to apply extra weight to first/last 5% of chart notes
-BOUNDARY_PCT = 0.05    # fraction of notes at each end that receive the boundary bonus
-STREAK_BONUS = False   # whether to apply a multiplier to notes that are isolated
-STREAK_BASE = 5.0     # the base of the sigmoid used (\frac{1-a^{-x}}{1+a^{-x}})
-
-# Audio - lowpass emphasizes kick/bass onsets; HPSS isolates percussive transients
-LOWPASS_HZ = 200     # lowpass cutoff
-SR = 22050           # target sample rate
-AUDIO_CLIP_S = 1800  # max seconds of audio to read (None = unlimited)
-
 # Display / runtime
 MAX_SONG_NAME = 50
-LIST_PATH = Path(__file__).parent / "yarg_sync_list.json"
 WORKER_THREADS = 6
 ETA_EMA_ALPHA = 0.1
 
@@ -77,6 +59,10 @@ EXCLUDED_CON_SUFFIXES = frozenset(EXTENSION_LIST + OTHER_EXTENSIONS)
 # STFS block geometry
 _STFS_BLOCK = 0x1000
 _STFS_BASE = 0xC000   # data area start; block 0 is always at 0xC000
+STFS_L0_TABLE_INTERVAL = 0xAA      # 170 blocks
+STFS_L1_TABLE_INTERVAL = 0x70E4    # 170^2 blocks
+STFS_DIRENT_SIZE = 0x40            # 64 bytes per entry
+STFS_DIRENTS_PER_BLOCK = 64        # 64 entries per block
 
 # Thresholds
 TOTAL_PCT_MIN = 0.1  # overridden to 0.2 in hard-score mode
@@ -158,8 +144,7 @@ def get_song_list(
 
     # Always exclude _extracted INIs whose parent CON/SNG is present
     # — pre_extract_all handles those, they'll be added back via extracted_map
-    excluded_dirs = {Path(str(p) + "_extracted") for p in cons} | \
-                    {Path(str(p) + "_extracted") for p in sngs}
+    excluded_dirs = {p.with_name(p.name + "_extracted") for p in set(cons) | set(sngs)}
 
     inis = sorted(
         p for p in root.rglob("song.ini")
@@ -174,12 +159,12 @@ def get_song_list(
 # --- STFS / CON container parsing (Xbox 360 packages) ---
 
 def _stfs_block_offset(block: int, table_size_shift: int) -> int:
-    """Convert logical block number to byte offset. table_size_shift=1 for CON (two hash tables per 170-block group)."""
+    """Convert logical block number to byte offset."""
     adjust = 0
-    if block >= 0xAA:
-        adjust += (block // 0xAA + 1) << table_size_shift
-    if block >= 0x70E4:
-        adjust += (block // 0x70E4 + 1) << table_size_shift
+    if block >= STFS_L0_TABLE_INTERVAL:
+        adjust += (block // STFS_L0_TABLE_INTERVAL + 1) << table_size_shift
+    if block >= STFS_L1_TABLE_INTERVAL:
+        adjust += (block // STFS_L1_TABLE_INTERVAL + 1) << table_size_shift
     return _STFS_BASE + (block + adjust) * _STFS_BLOCK
 
 
@@ -293,8 +278,8 @@ def _stfs_list_files(data: bytes, info: dict, debug: bool = False) -> list[dict]
             break
         blk = data[blk_off:blk_off + _STFS_BLOCK]
 
-        for j in range(64):
-            e = blk[j * 0x40:(j + 1) * 0x40]
+        for j in range(STFS_DIRENTS_PER_BLOCK):
+            e = blk[j * STFS_DIRENT_SIZE:(j + 1) * STFS_DIRENT_SIZE]
             if len(e) < 0x40:
                 break
             flags = e[0x28]
@@ -744,8 +729,6 @@ def decode_png_xbox(raw: bytes):
 
 # --- MOGG audio splitting (ffmpeg stem separation) ---
 
-import math
-
 
 def _db_to_gain(db: float) -> float:
     return math.pow(10.0, db / 20.0)
@@ -762,6 +745,23 @@ def _pan_coefficients(pan: float) -> tuple[float, float]:
     left = (1.0 - pan) / 2.0
     right = (1.0 + pan) / 2.0
     return left, right
+
+
+def _safe_popen(cmd: list[str], **kwargs) -> subprocess.Popen:
+    """Safely open a subprocess with pipeline defaults and unified error handling."""
+    try:
+        return subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            **kwargs
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            f"Executable not found: {e.filename!r} while running: {' '.join(cmd)}"
+        ) from e
+
 
 def _split_mogg(
     mogg_bytes: bytes,
@@ -803,18 +803,7 @@ def _split_mogg(
                 "-of", "default=nokey=1:noprint_wrappers=1",
                 "pipe:0",
             ]
-            try:
-                proc = subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
-            except FileNotFoundError as e:
-                raise RuntimeError(
-                    f"Executable not found: {e.filename!r} while running: {' '.join(cmd)}"
-                ) from e
-
+            proc = _safe_popen(cmd)
             out, _ = proc.communicate(input=data)
             try:
                 return int(out.strip())
@@ -865,18 +854,14 @@ def _split_mogg(
 
                     try:
                         value = entry[name]
-                        if isinstance(value, int):
-                            channels = [value]
-                        elif isinstance(value, dict):
-                            raw = value.get("_values", [])
-                            if raw and isinstance(raw[0], list):
-                                channels = raw[0]
-                            elif isinstance(raw, list):
-                                channels = raw
-                            else:
-                                channels = []
+                        if isinstance(value, dict):
+                            value = value.get("_values", [])
+                        
+                        # Unpack structural entries like [[0, 1]] or simple lists [0, 1]
+                        if isinstance(value, list) and value and isinstance(value[0], list):
+                            channels = value[0]
                         else:
-                            channels = []
+                            channels = value if isinstance(value, list) else [value] if isinstance(value, int) else []
 
                         if not isinstance(channels, list) or not channels:
                             continue
@@ -893,23 +878,19 @@ def _split_mogg(
     except Exception as e:
         dprint(debug, f"DTA parse error: {e}")
 
-    try:
-        if song_info:
-            vols = song_info.get("vols")
-            if isinstance(vols, dict):
-                raw = vols.get("_values", [])
-                if raw and isinstance(raw[0], list):
-                    values = raw[0]
-                    for i, value in enumerate(values[:n_ch]):
-                        channel_vols[i] = float(value)
+    def _parse_dta_floats(key: str, target_list: list[float]):
+        if not song_info:
+            return
+        node = song_info.get(key)
+        if isinstance(node, dict):
+            raw = node.get("_values", [])
+            if raw and isinstance(raw[0], list):
+                for i, val in enumerate(raw[0][:n_ch]):
+                    target_list[i] = float(val)
 
-            pans = song_info.get("pans")
-            if isinstance(pans, dict):
-                raw = pans.get("_values", [])
-                if raw and isinstance(raw[0], list):
-                    values = raw[0]
-                    for i, value in enumerate(values[:n_ch]):
-                        channel_pans[i] = float(value)
+    try:
+        _parse_dta_floats("vols", channel_vols)
+        _parse_dta_floats("pans", channel_pans)
     except Exception as e:
         dprint(debug, f"Failed reading pans/vols: {e}")
 
@@ -923,26 +904,6 @@ def _split_mogg(
 
     # Build ffmpeg filter graph
     filter_parts = []
-
-    left_terms = []
-    right_terms = []
-
-    for ch in range(n_ch):
-        gain = _db_to_gain(channel_vols[ch])
-        left_pan, right_pan = _pan_coefficients(channel_pans[ch])
-
-        if left_pan:
-            left_terms.append(f"{gain * left_pan:.6f}*c{ch}")
-
-        if right_pan:
-            right_terms.append(f"{gain * right_pan:.6f}*c{ch}")
-
-    left_expr = "+".join(left_terms) or "0"
-    right_expr = "+".join(right_terms) or "0"
-
-    filter_parts.append(
-        f"[0:a]pan=stereo|c0={left_expr}|c1={right_expr}[mix]"
-    )
 
     def _pan(channels: list[int], label: str) -> str:
         left_terms = []
@@ -972,36 +933,47 @@ def _split_mogg(
             f"[{label}]"
         )
 
-    output_args = [
-        "-map", "[mix]",
-        "-c:a", "libvorbis",
-        "-q:a", str(quality),
-        str(dest_dir / "song.ogg"),
-    ]
+    output_args = []
 
+    # Build stems from DTA
     # Build stems from DTA
     for idx, name in stem_names.items():
         channels = stem_channels.get(idx, [])
         if not channels:
             continue
+        
+        # If a track has more than 2 channels, split it into sequential pairs/stems
+        if len(channels) > 2:
+            for sub_idx in range(0, len(channels), 2):
+                sub_ch = channels[sub_idx:sub_idx+2]
+                stem_num = (sub_idx // 2) + 1
+                label = f"stem{idx}_{stem_num}"
+                filter_parts.append(_pan(sub_ch, label))
+                out_path = dest_dir / f"{name}_{stem_num}.ogg"
+                output_args += [
+                    "-map", f"[{label}]",
+                    "-c:a", "libvorbis",
+                    "-q:a", str(quality),
+                    str(out_path),
+                ]
+        else:
+            # Standard mono/stereo tracks remain single files
+            label = f"stem{idx}"
+            filter_parts.append(_pan(channels, label))
+            out_path = dest_dir / f"{name}.ogg"
+            output_args += [
+                "-map", f"[{label}]",
+                "-c:a", "libvorbis",
+                "-q:a", str(quality),
+                str(out_path),
+            ]
 
-        label = f"stem{idx}"
-        filter_parts.append(_pan(channels, label))
-
-        out_path = dest_dir / f"{name}.ogg"
-        output_args += [
-            "-map", f"[{label}]",
-            "-c:a", "libvorbis",
-            "-q:a", str(quality),
-            str(out_path),
-        ]
-
-    # Add backing stem if needed
+    # Add backing stem mapped directly as song.ogg if needed
     if stem_channels_extra:
         label = "stem_backing"
         filter_parts.append(_pan(stem_channels_extra, label))
 
-        out_path = dest_dir / "backing.ogg"
+        out_path = dest_dir / "song.ogg"
         output_args += [
             "-map", f"[{label}]",
             "-c:a", "libvorbis",
@@ -1012,17 +984,7 @@ def _split_mogg(
     done_event = threading.Event()
 
     cmd = ["ffmpeg", "-y", "-i", "pipe:0", "-filter_complex", ";".join(filter_parts)] + output_args
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-    except FileNotFoundError as e:
-        raise RuntimeError(
-            f"Executable not found: {e.filename!r} while running: {' '.join(cmd)}"
-        ) from e
+    proc = _safe_popen(cmd)
 
     def _watch_cancel():
         if cancel_event is not None:
@@ -1049,8 +1011,20 @@ def _split_mogg(
 
 # --- song.ini writing & extraction-cache helpers ---
 
+GAMES = {
+    'rb1': 'rb1',
+    'rb2': 'rb2',
+    'rb3': 'rb3',
+    'rb4': 'rb4',
+    'beatles': 'tbrb',
+    'lego': 'lrb',
+    'green': 'gdrb',
+    'rivals': 'rb4rivals'
+}
+
 def _write_song_ini(dest_dir: Path, name: str, artist: str, extra: dict,
-                     shortname: str | None = None, dtaname: str | None = None) -> None:
+                     shortname: str | None = None, dtaname: str | None = None,
+                     is_multi_pack: bool = False) -> None:
     """Write song.ini from extracted metadata, skipping numeric-only keys and reserved fields."""
     SKIP_KEYS = {"name", "title", "artist", "delay", "song", "shortname", "dtaname"}
     lines = ["[song]", f"name = {name}", f"artist = {artist}", "delay = 0"]
@@ -1060,6 +1034,19 @@ def _write_song_ini(dest_dir: Path, name: str, artist: str, extra: dict,
         lines.append(f"dtaname = {dtaname}")
     lines += [f"{key} = {value}" for key, value in extra.items()
               if not str(key).isdigit() and key not in SKIP_KEYS]
+    if is_multi_pack:
+        for i, line in enumerate(lines):
+            if line.startswith("icon = "):
+                break
+        for game in GAMES:
+            con_name_lower = str(dest_dir.parent.name).lower()
+            dlc_str = 'dlc' if 'dlc' in con_name_lower else ''
+            if game in con_name_lower:
+                if i + 1 == len(lines):
+                    lines.append(f"icon = {GAMES[game] + dlc_str}")
+                    continue
+                lines[i] = f"icon = {GAMES[game] + dlc_str}"
+
     if not dest_dir.exists():
         dest_dir.mkdir(parents=True, exist_ok=True)
     (dest_dir / "song.ini").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -1095,13 +1082,9 @@ def find_audio_candidates(folder: Path, calibration=True) -> list[Path]:
 
 
 def _is_extraction_cache_fresh(source: Path, dest: Path, require_chart_or_mid: bool = False) -> bool:
-    # if not _has_audio(dest):
-    #     return False
-    # if require_chart_or_mid:
-    #     has_chart = (dest / "notes.mid").exists() or (dest / "notes.chart").exists()
-    #     return has_chart and source.stat().st_mtime <= dest.stat().st_mtime
-    # return (dest / "notes.mid").exists() and source.stat().st_mtime <= dest.stat().st_mtime
-    return False # still needs some work, can't check for unfinished .ogg files or deleted files
+    """Check if the extracted folder cache is up-to-date."""
+    # TODO: Implement accurate freshness check for .ogg and chart files
+    return False
 
 
 # --- CON extraction (Xbox 360 package -> folder) ---
@@ -1174,7 +1157,7 @@ def con_extract_multi_to_folder(
 ) -> list[Path]:
     """Extract a multi-song CON pack (e.g. RBN compilation) into one subfolder
     per bundled song under dest_dir. Returns the list of per-song folders."""
-    print(f"Found files: {[e.get('name') for e in entries]}")
+    # print(f"Found files: {[e.get('name') for e in entries]}")
     # for e in entries:
     #     name = e["name"]
     #     if not name.endswith((".bin", ".mid", ".mogg", ".usr", ".vnn", ".voc", ".xvocab")):
@@ -1184,9 +1167,9 @@ def con_extract_multi_to_folder(
     results: list[Path] = []
     t_prev = time.perf_counter()
 
-    print(f"Songs metadata: {songs_meta}")
+    # print(f"Songs metadata: {songs_meta}")
     for i, (shortname, meta) in enumerate(songs_meta.items()):
-        # if shortname not in ["warpigs", "youshookme_live", "youngerbums"]:
+        # if shortname not in ["maps"]:
         #     continue
         song_blob = meta.get("song")
         basename = shortname
@@ -1237,7 +1220,7 @@ def con_extract_multi_to_folder(
                 dta_meta.setdefault(key, value)
 
         # in con_extract_multi_to_folder (~line 1228):
-        song_info = _write_con_song_ini(con_path, song_dest, basename, dta_meta, dtaname=shortname, dump_raw=dump_raw, debug=debug)
+        song_info = _write_con_song_ini(con_path, song_dest, basename, dta_meta, dtaname=shortname, dump_raw=dump_raw, debug=debug, is_multi_pack=True)
         _write_song_assets(song_dest, mid_bytes, mogg_bytes, debug, song_info, cancel_event=cancel_event)
         (song_dest / ".extraction_complete").touch()
         results.append(song_dest)
@@ -1293,7 +1276,7 @@ def con_extract_to_folder(
         for key, value in midi_metadata_from_bytes(mid_bytes, debug).items():
             dta_meta.setdefault(key, value)
 
-    song_info = _write_con_song_ini(con_path, dest_dir, display, dta_meta, dtaname=dtaname, dump_raw=dump_raw, debug=debug)
+    song_info = _write_con_song_ini(con_path, dest_dir, display, dta_meta, dtaname=dtaname, dump_raw=dump_raw, debug=debug, is_multi_pack = False)
     _write_song_assets(dest_dir, mid_bytes, mogg_bytes, debug, song_info, cancel_event=cancel_event)
     (dest_dir / ".extraction_complete").touch()
     return dest_dir
@@ -1425,7 +1408,8 @@ def _write_song_assets(dest_dir: Path, mid_bytes: bytes | None, mogg_bytes: byte
 
 def _write_con_song_ini(con_path: Path, dest_dir: Path, display: str, dta_meta: dict,
                         dtaname: str | None = None,
-                        dump_raw: bool = False, debug: bool = False) -> dict | None:
+                        dump_raw: bool = False, debug: bool = False,
+                        is_multi_pack: bool = False) -> dict | None:
     if dump_raw and debug:
         try:
             (dest_dir / "dta_meta_debug.json").write_text(
@@ -1482,7 +1466,7 @@ def _write_con_song_ini(con_path: Path, dest_dir: Path, display: str, dta_meta: 
             continue
         extra[key_change.get(key, key)] = value
 
-    _write_song_ini(dest_dir, name, artist, extra, shortname=shortname, dtaname=dtaname)
+    _write_song_ini(dest_dir, name, artist, extra, shortname=shortname, dtaname=dtaname, is_multi_pack = is_multi_pack)
     return extra.get("song")
 
 
