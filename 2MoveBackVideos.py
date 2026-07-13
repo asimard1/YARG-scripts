@@ -2,8 +2,10 @@ from pathlib import Path
 from difflib import SequenceMatcher
 import shutil
 import tqdm
+import time
 
 def moveVideos(path: Path):
+    t0 = time.perf_counter()
     print("\n")
     video_source_dir = path / (path.name + " Videos")
     if not video_source_dir.exists():
@@ -11,7 +13,7 @@ def moveVideos(path: Path):
     print(f"Getting videos from {video_source_dir}.")
     videos_list = sorted(list(video_source_dir.rglob("*.mp4")) + list(video_source_dir.rglob("*.webm")))
     already_found = {}
-    potential_dest_list = sorted([file for file in path.rglob("*") if file.is_dir() and str(video_source_dir) not in str(file)])
+    potential_dest_list = sorted([file for file in path.rglob("*") if file.is_dir() and str(video_source_dir) not in str(file) and 'songs_updates' not in str(file) and 'Fortnite' not in str(file)])
     print(f"Checking {len(videos_list)} videos against {len(potential_dest_list)} folders.")
     print("Finding best fits...")
     for video in tqdm.tqdm(videos_list): # Finding fits
@@ -39,11 +41,10 @@ def moveVideos(path: Path):
             recorded_sim = recorded[1]
             fitting = best_folder.name if isinstance(best_folder, Path) else "None"
 
-            print(f"\nPROBLEM PROBLEM: {current_video}: found fitting folder: {fitting}")
+            print(f"\nPROBLEM PROBLEM")
+            print(f"Source: {video} ({recorded_sim:.3f})\nNew source: {best_folder} ({best_sim:.3f})\nBoth chosen to go to: {recorded[0]}")
             if best_folder == "":
                 break
-            print(f"Was already chosen by: {recorded_name}")
-            print(f"Recorded sim: {recorded_sim:.3f}. New sim: {best_sim:.3f}")
             if best_sim < recorded_sim:
                 # We don't want to replace
                 continue
@@ -53,9 +54,12 @@ def moveVideos(path: Path):
         #     print(line_str)
         if best_folder in already_found:
             print("Replacing...")
+        if list(best_folder.rglob('*.webm')):
+            print(f"PROBLEM PROBLEM {video} chose {best_folder} but this folder already has a video.")
+            break
         already_found[best_folder] = [video, best_sim]
 
-    print("Moving video around...")
+    print("Moving videos around...")
     k = 0
     for best_folder in tqdm.tqdm(already_found): # Moving videos
         video_path = already_found[best_folder][0]
@@ -68,7 +72,7 @@ def moveVideos(path: Path):
             continue
         shutil.move(video_path, best_folder / video_path.name)
         k += 1
-    print(f"Moved {k} videos.")
+    print(f"Moved {k} videos in {time.perf_counter() - t0:.1f} seconds.")
 
 
     print("\n")

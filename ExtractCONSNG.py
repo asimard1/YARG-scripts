@@ -698,33 +698,65 @@ def midi_metadata(mid_path: Path, debug: bool = False) -> dict:
 
 # --- Album art (Xbox PNG/BC1 texture decoding) ---
 
-HEADER_SIZE = 32
-BC1_BLOCK_SIZE = 8
-
+import texture2ddecoder
+from PIL import Image
 
 def swap_bc1_endian(data: bytes) -> bytes:
-    """Swap the RGB565 endpoints and the BC1 lookup bytes."""
-    out = bytearray(len(data))
-    for i in range(0, len(data), 8):
-        block = bytearray(data[i:i + 8])
-        if len(block) < 8:
-            break
-        # RGB565 endpoints
-        block[0], block[1] = block[1], block[0]
-        block[2], block[3] = block[3], block[2]
-        # BC1 lookup table
-        block[4], block[5] = block[5], block[4]
-        block[6], block[7] = block[7], block[6]
-        out[i:i + 8] = block
-    return bytes(out)
+    ba = bytearray(data)
+    for i in range(0, len(ba) - 1, 2):
+        ba[i], ba[i + 1] = ba[i + 1], ba[i]
+    return bytes(ba)
+
+def find_base_size(raw: bytes, header_size=32, block_size=8):
+    total_blocks = (len(raw) - header_size) // block_size
+    for pow_diff in [0, -1]:
+        for w in [2**pow for pow in range(11, 5, -1)]:
+            h = int(w * 2**pow_diff)
+            blocks, bw, bh = 0, w, h
+            while bw >= 4 or bh >= 4:
+                wb, hb = max(1, bw // 4), max(1, bh // 4)
+                if blocks + wb * hb > total_blocks:
+                    break
+                blocks += wb * hb
+                if blocks == total_blocks:
+                    return w, h
+                bw, bh = bw // 2, bh // 2
+    raise ValueError("no matching base size found")
 
 
-def decode_png_xbox(raw: bytes):
-    width = height = 256
-    image_size = (width // 4) * (height // 4) * BC1_BLOCK_SIZE
-    pixel_data = swap_bc1_endian(raw[HEADER_SIZE:HEADER_SIZE + image_size])
+def decode_png_xbox(raw: bytes, header_size=32, block_size=8) -> Image.Image:
+    # 1. Check if the raw data suggests a potential half-skip configuration
+    # Instead of guessing at the end, find the base size of the full payload first
+    width, height = find_base_size(raw, header_size, block_size)
+    
+    # 2. Extract full payload
+    image_size = (width // 4) * (height // 4) * block_size
+    full_payload = raw[header_size:header_size + image_size]
+    
+    # 3. Filter blocks (Slicing with a step [1::2] is much faster than a list comprehension loop)
+    # This grabs starting from index 1 (the 2nd block), skipping every second block
+    if height == width // 2:
+        # Instead of looping with 'if i % 2 == 1', use Python's built-in stride slicing
+        # memoryview prevents copying the bytes into memory over and over
+        mv = memoryview(full_payload)
+        blocks = [bytes(mv[i:i + block_size]) for i in range(0, len(full_payload), block_size)]
+        new_blocks = blocks[1::2] # Starts at 1, steps by 2
+        
+        # Re-verify the layout dimensions with the shortened payload size
+        # Create a dummy payload to pass to find_base_size
+        dummy_raw = b'\x00' * header_size + b''.join(new_blocks)
+        width, height = find_base_size(dummy_raw, header_size, block_size)
+    else:
+        # No skipping needed
+        pixel_data = swap_bc1_endian(full_payload)
+        rgba = texture2ddecoder.decode_bc1(pixel_data, width, height)
+        return Image.frombytes("RGBA", (width, height), rgba, "raw", "BGRA")
+
+    # 4. Reconstruct the byte stream and swap endianness
+    pixel_data = swap_bc1_endian(b''.join(new_blocks))
     rgba = texture2ddecoder.decode_bc1(pixel_data, width, height)
     return Image.frombytes("RGBA", (width, height), rgba, "raw", "BGRA")
+
 
 
 # --- MOGG audio splitting (ffmpeg stem separation) ---
@@ -1169,8 +1201,8 @@ def con_extract_multi_to_folder(
 
     # print(f"Songs metadata: {songs_meta}")
     for i, (shortname, meta) in enumerate(songs_meta.items()):
-        # if shortname not in ["maps"]:
-        #     continue
+        if shortname not in ["photograph", "gimmesomemoney", "funkysexfarm"]:
+            continue
         song_blob = meta.get("song")
         basename = shortname
         if isinstance(song_blob, dict) and isinstance(song_blob.get("name"), str) and song_blob["name"]:
