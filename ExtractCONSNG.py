@@ -1201,8 +1201,8 @@ def con_extract_multi_to_folder(
 
     # print(f"Songs metadata: {songs_meta}")
     for i, (shortname, meta) in enumerate(songs_meta.items()):
-        if shortname not in ["photograph", "gimmesomemoney", "funkysexfarm"]:
-            continue
+        # if shortname not in ["jenny", "angryyoungman"]:
+        #     continue
         song_blob = meta.get("song")
         basename = shortname
         if isinstance(song_blob, dict) and isinstance(song_blob.get("name"), str) and song_blob["name"]:
@@ -1252,7 +1252,7 @@ def con_extract_multi_to_folder(
                 dta_meta.setdefault(key, value)
 
         # in con_extract_multi_to_folder (~line 1228):
-        song_info = _write_con_song_ini(con_path, song_dest, basename, dta_meta, dtaname=shortname, dump_raw=dump_raw, debug=debug, is_multi_pack=True)
+        song_info = _write_con_song_ini(con_path, song_dest, title, artist, dta_meta, dtaname=shortname, dump_raw=dump_raw, debug=debug, is_multi_pack=True)
         _write_song_assets(song_dest, mid_bytes, mogg_bytes, debug, song_info, cancel_event=cancel_event)
         (song_dest / ".extraction_complete").touch()
         results.append(song_dest)
@@ -1308,7 +1308,7 @@ def con_extract_to_folder(
         for key, value in midi_metadata_from_bytes(mid_bytes, debug).items():
             dta_meta.setdefault(key, value)
 
-    song_info = _write_con_song_ini(con_path, dest_dir, display, dta_meta, dtaname=dtaname, dump_raw=dump_raw, debug=debug, is_multi_pack = False)
+    song_info = _write_con_song_ini(con_path, dest_dir, display, None, dta_meta, dtaname=dtaname, dump_raw=dump_raw, debug=debug, is_multi_pack = False)
     _write_song_assets(dest_dir, mid_bytes, mogg_bytes, debug, song_info, cancel_event=cancel_event)
     (dest_dir / ".extraction_complete").touch()
     return dest_dir
@@ -1438,8 +1438,9 @@ def _write_song_assets(dest_dir: Path, mid_bytes: bytes | None, mogg_bytes: byte
         _split_mogg(mogg_bytes, dest_dir, debug, song_info=song_info, cancel_event=cancel_event)
 
 
-def _write_con_song_ini(con_path: Path, dest_dir: Path, display: str, dta_meta: dict,
-                        dtaname: str | None = None,
+def _write_con_song_ini(con_path: Path, dest_dir: Path,
+                        display: str, display_artist: str | None,
+                        dta_meta: dict, dtaname: str | None = None,
                         dump_raw: bool = False, debug: bool = False,
                         is_multi_pack: bool = False) -> dict | None:
     if dump_raw and debug:
@@ -1451,7 +1452,7 @@ def _write_con_song_ini(con_path: Path, dest_dir: Path, display: str, dta_meta: 
             pass
 
     con_parts = con_path.name.split(" - ")
-    default_artist = con_parts[0] if len(con_parts) > 0 else "Unknown Artist"
+    default_artist = con_parts[0] if len(con_parts) > 0 else display_artist or "Unknown Artist"
     default_name = con_parts[-1] if len(con_parts) > 1 else display
 
     name = dta_meta.get("name") or dta_meta.get("title") or default_name
