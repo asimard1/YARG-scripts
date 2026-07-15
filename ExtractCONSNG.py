@@ -1189,22 +1189,17 @@ def con_extract_multi_to_folder(
 ) -> list[Path]:
     """Extract a multi-song CON pack (e.g. RBN compilation) into one subfolder
     per bundled song under dest_dir. Returns the list of per-song folders."""
-    # print(f"Found files: {[e.get('name') for e in entries]}")
-    # for e in entries:
-    #     name = e["name"]
-    #     if not name.endswith((".bin", ".mid", ".mogg", ".usr", ".vnn", ".voc", ".xvocab")):
-    #         print(e["name"])
     base_dest = dest_dir or Path(str(con_path) + "_extracted")
     base_dest.mkdir(parents=True, exist_ok=True)
     results: list[Path] = []
     t_prev = time.perf_counter()
 
     # print(f"Songs metadata: {songs_meta}")
-    for i, (shortname, meta) in enumerate(songs_meta.items()):
-        # if shortname not in ["jenny", "angryyoungman"]:
+    for i, (dtaname, meta) in enumerate(songs_meta.items()):
+        # if dtaname not in ["masterslave", "goodmorningblackfriday", "hellionelectriceye", "onelove", "foreplaylongtime"]:
         #     continue
         song_blob = meta.get("song")
-        basename = shortname
+        basename = dtaname
         if isinstance(song_blob, dict) and isinstance(song_blob.get("name"), str) and song_blob["name"]:
             basename = song_blob["name"].rsplit("/", 1)[-1]
 
@@ -1252,7 +1247,7 @@ def con_extract_multi_to_folder(
                 dta_meta.setdefault(key, value)
 
         # in con_extract_multi_to_folder (~line 1228):
-        song_info = _write_con_song_ini(con_path, song_dest, title, artist, dta_meta, dtaname=shortname, dump_raw=dump_raw, debug=debug, is_multi_pack=True)
+        song_info = _write_con_song_ini(con_path, song_dest, title, artist, dta_meta, dtaname=dtaname, dump_raw=dump_raw, debug=debug, is_multi_pack=True)
         _write_song_assets(song_dest, mid_bytes, mogg_bytes, debug, song_info, cancel_event=cancel_event)
         (song_dest / ".extraction_complete").touch()
         results.append(song_dest)
@@ -1712,6 +1707,7 @@ def pre_extract_all(
                     and any(d.is_dir() and (d / "song.ini").exists() for d in song_folder.iterdir())
                 )
 
+                print("is_multi_song:", is_multi_song)
                 if is_multi_song:
                     song_subfolders = [d for d in song_folder.iterdir() if d.is_dir() and (d / "song.ini").exists()]
                     nb_songs_extracted = len(song_subfolders)
