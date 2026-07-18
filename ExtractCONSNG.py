@@ -1032,41 +1032,56 @@ def _split_mogg(
 
 # --- song.ini writing & extraction-cache helpers ---
 
-GAMES = {
-    'rb1': 'rb1',
-    'rb2': 'rb2',
-    'rb3': 'rb3',
-    'rb4': 'rb4',
-    'beatles': 'tbrb',
-    'lego': 'lrb',
-    'green': 'gdrb',
-    'rivals': 'rb4rivals'
+GAME_ICONS = {
+    "rb1": "rb1",
+    "rb2": "rb2",
+    "rb3": "rb3",
+    "rb4": "rb4",
+    "beatles": "tbrb",
+    "lego": "lrb",
+    "green": "gdrb",
+    "rivals": "rb4rivals",
+}
+SONG_INI_SKIP_KEYS = {
+    "name",
+    "title",
+    "artist",
+    "delay",
+    "song",
+    "shortname",
+    "dtaname",
 }
 
 def _write_song_ini(dest_dir: Path, name: str, artist: str, extra: dict,
                      shortname: str | None = None, dtaname: str | None = None,
                      is_multi_pack: bool = False) -> None:
     """Write song.ini from extracted metadata, skipping numeric-only keys and reserved fields."""
-    SKIP_KEYS = {"name", "title", "artist", "delay", "song", "shortname", "dtaname"}
     lines = ["[song]", f"name = {name}", f"artist = {artist}", "delay = 0"]
     if shortname:
         lines.append(f"shortname = {shortname}")
     if dtaname:
         lines.append(f"dtaname = {dtaname}")
     lines += [f"{key} = {value}" for key, value in extra.items()
-              if not str(key).isdigit() and key not in SKIP_KEYS]
+              if not str(key).isdigit() and key not in SONG_INI_SKIP_KEYS]
     if is_multi_pack:
-        for i, line in enumerate(lines):
-            if line.startswith("icon = "):
-                break
-        for game in GAMES:
-            con_name_lower = str(dest_dir.parent.name).lower()
-            dlc_str = 'dlc' if 'dlc' in con_name_lower else ''
-            if game in con_name_lower:
-                if i + 1 == len(lines):
-                    lines.append(f"icon = {GAMES[game] + dlc_str}")
-                    continue
-                lines[i] = f"icon = {GAMES[game] + dlc_str}"
+        con_name_lower = dest_dir.parent.name.lower()
+        dlc_suffix = "dlc" if "dlc" in con_name_lower else ""
+
+        icon_index = next(
+            (i for i, line in enumerate(lines) if line.startswith("icon = ")),
+            None,
+        )
+
+        for game, icon in GAME_ICONS.items():
+            if game not in con_name_lower:
+                continue
+
+            value = icon + dlc_suffix
+            if icon_index is None:
+                lines.append(f"icon = {value}")
+            else:
+                lines[icon_index] = f"icon = {value}"
+            break
 
     if not dest_dir.exists():
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -1150,22 +1165,191 @@ def _entry_matches_song_basename(entry_name: str, basename: str) -> bool:
     return rest == "" or rest[0] in "._"
 
 
-def _find_multi_song_dta(entries: list[dict], data: bytes, table_size_shift: int, debug: bool) -> dict[str, dict]:
-    """Return {shortname: meta} if this CON bundles 2+ songs, else {}."""
+def _split_songs_dta(raw_dta: bytes) -> dict[str, str]:
+    """Split a songs.dta containing multiple songs into individual DTA blocks.
+
+    Returns:
+        {
+            "shortname": "(shortname ...)",
+            ...
+        }
+    """
+    text = raw_dta.decode("utf-8", errors="ignore").strip()
+
+    songs: dict[str, str] = {}
+
+    depth = 0
+    start = None
+    in_string = False
+    escape = False
+
+    for i, char in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+            continue
+
+        if char == "(":
+            if depth == 0:
+                start = i
+            depth += 1
+
+        elif char == ")":
+            depth -= 1
+
+            if depth == 0 and start is not None:
+                block = text[start:i + 1]
+
+                # Extract the shortname from "(shortname ..."
+                name_end = 1
+                while name_end < len(block) and not block[name_end].isspace():
+                    name_end += 1
+
+                shortname = block[1:name_end]
+
+                songs[shortname] = block
+                start = None
+
+    return songs
+
+
+def _find_multi_song_dta(entries: list[dict], data: bytes, table_size_shift: int, debug: bool) -> dict[str, str] | None:
+    """Return {shortname: meta} if this CON bundles 2+ songs, else None."""
     dta_entry = next((e for e in entries if e["name"].lower() == "songs.dta"), None)
     if not dta_entry:
-        return {}
+        return None
     raw = _stfs_read_file(data, dta_entry["first_blk"], dta_entry["size"], table_size_shift,
                           is_contiguous=dta_entry.get("alloc_blocks", 0) > 0, debug=debug)
     if not raw:
-        return {}
-    grouped = _parse_songs_dta_grouped(raw.decode("utf-8", errors="ignore"))
-    return grouped if len(grouped) > 1 else {}
+        return None
+
+    grouped = _split_songs_dta(raw)
+
+    return grouped if len(grouped) > 1 else None
+
+
+def _write_extracted_song(
+    *,
+    con_path: Path,
+    song_dest: Path,
+    files: dict[str, tuple[str, bytes]],
+    title: str,
+    artist: str | None,
+    dta_meta: dict,
+    song_dta: str,
+    dtaname: str | None,
+    dump_raw: bool,
+    debug: bool,
+    cancel_event: threading.Event | None,
+    extract_mogg: bool,
+    extract_png: bool,
+    is_multi_pack: bool,
+) -> None:
+    art_png_info = files.get("art_png")
+    if art_png_info:
+        name, raw = art_png_info
+        dprint(debug, f"Album art: {name} ({len(raw)} bytes)")
+        if extract_png:
+            print("Writing png")
+            try:
+                decode_png_xbox(raw, debug).save(song_dest / "album.png")
+                dprint(debug, "Album art extracted successfully.")
+            except Exception as e:
+                dprint(debug, f"Failed to decode album art ({name}): {e}")
+        else:
+            try:
+                (song_dest / "album.png_xbox").write_bytes(raw)
+            except:
+                print("[WARNING] png_xbox could not be created")
+
+    milo_xbox_bytes = files.get("milo_xbox", (None, None))[1]
+    milo_bytes = files.get("milo", (None, None))[1]
+
+    if milo_xbox_bytes and milo_bytes:
+        dprint(debug, "Found both milo and milo_xbox")
+    if milo_xbox_bytes:
+        (song_dest / "song.milo_xbox").write_bytes(milo_xbox_bytes)
+    if milo_bytes:
+        (song_dest / "song.milo").write_bytes(milo_bytes)
+    if not (milo_xbox_bytes or milo_bytes):
+        dprint(debug, "No milo found")
+
+    mid_bytes = files.get("mid", (None, None))[1]
+    mogg_bytes = files.get("mogg", (None, None))[1]
+
+    if mid_bytes:
+        for key, value in midi_metadata_from_bytes(mid_bytes, debug).items():
+            dta_meta.setdefault(key, value)
+        (song_dest / "notes.mid").write_bytes(mid_bytes)
+
+    song_info = _write_con_song_ini(
+        con_path,
+        song_dest,
+        title,
+        artist,
+        dta_meta,
+        dtaname=dtaname,
+        dump_raw=dump_raw,
+        debug=debug,
+        is_multi_pack=is_multi_pack,
+    )
+
+    _write_audio_assets(
+        song_dest,
+        mogg_bytes,
+        song_dta,
+        debug,
+        song_info,
+        cancel_event=cancel_event,
+        extract_mogg=extract_mogg,
+    )
+
+    (song_dest / ".extraction_complete").touch()
+
+
+def _collect_song_files(
+    basename: str,
+    entries: list[dict],
+    data: bytes,
+    table_size_shift: int,
+    song_dest: Path,
+    dump_raw: bool,
+    debug: bool,
+) -> dict[str, tuple[str, bytes]]:
+    files: dict[str, tuple[str, bytes]] = {}
+    for entry in entries:
+        if entry["is_dir"] or entry["size"] == 0:
+            continue
+        if not _entry_matches_song_basename(entry["name"], basename):
+            continue
+        raw = _stfs_read_file(data, entry["first_blk"], entry["size"], table_size_shift,
+                                is_contiguous=entry.get("alloc_blocks", 0) > 0, debug=debug,
+                                dbg_name=f"{basename}/{entry['name']}")
+        if not raw:
+            continue
+        if dump_raw:
+            (song_dest / "raw").mkdir(parents=True, exist_ok=True)
+            (song_dest / "raw" / entry["name"]).write_bytes(raw)
+        kind = _classify_con_entry(entry["name"])
+        dprint(debug, f"{entry["name"]}, {kind}")
+        if kind == "mid":
+            _debug_check_mid(f"{basename}/{entry['name']}", raw, debug)
+        if kind:
+            _set_kind_with_priority(files, kind, entry["name"], raw, basename)
+    return files
 
 
 def con_extract_multi_to_folder(
     con_path: Path,
-    songs_meta: dict[str, dict],
+    songs_meta: dict[str, str],
     entries: list[dict],
     data: bytes,
     table_size_shift: int,
@@ -1175,7 +1359,8 @@ def con_extract_multi_to_folder(
     overwrite: bool = False,
     cancel_event: threading.Event | None = None,
     on_song_done: Callable[[Path, float, int, int], None] | None = None,
-    extract_mogg: bool = False
+    extract_mogg: bool = False,
+    extract_png: bool = False
 ) -> list[Path]:
     """Extract a multi-song CON pack (e.g. RBN compilation) into one subfolder
     per bundled song under dest_dir. Returns the list of per-song folders."""
@@ -1185,9 +1370,12 @@ def con_extract_multi_to_folder(
     t_prev = time.perf_counter()
 
     # print(f"Songs metadata: {songs_meta}")
-    for i, (dtaname, meta) in enumerate(songs_meta.items()):
+    for i, (dtaname, song_dta) in enumerate(songs_meta.items()):
         # if dtaname not in ["masterslave", "goodmorningblackfriday", "hellionelectriceye", "onelove", "foreplaylongtime"]:
         #     continue
+        
+        
+        meta = _parse_songs_dta(song_dta)
         song_blob = meta.get("song")
         basename = dtaname
         if isinstance(song_blob, dict) and isinstance(song_blob.get("name"), str) and song_blob["name"]:
@@ -1200,60 +1388,26 @@ def con_extract_multi_to_folder(
         if song_dest is None:
             continue
 
-        files: dict[str, tuple[str, bytes]] = {}
-        for entry in entries:
-            if entry["is_dir"] or entry["size"] == 0:
-                continue
-            if not _entry_matches_song_basename(entry["name"], basename):
-                continue
-            raw = _stfs_read_file(data, entry["first_blk"], entry["size"], table_size_shift,
-                                  is_contiguous=entry.get("alloc_blocks", 0) > 0, debug=debug,
-                                  dbg_name=f"{basename}/{entry['name']}")
-            if not raw:
-                continue
-            if dump_raw:
-                (song_dest / "raw").mkdir(parents=True, exist_ok=True)
-                (song_dest / "raw" / entry["name"]).write_bytes(raw)
-            kind = _classify_con_entry(entry["name"])
-            print(entry["name"], kind)
-            if kind == "mid":
-                _debug_check_mid(f"{basename}/{entry['name']}", raw, debug)
-            if kind:
-                _set_kind_with_priority(files, kind, entry["name"], raw, basename)
-
-        art_png_info = files.get("art_png")
-        if art_png_info:
-            name, raw = art_png_info
-            try:
-                decode_png_xbox(raw, debug).save(song_dest / "album.png")
-            except Exception as e:
-                dprint(debug, f"Failed to decode album art ({name}): {e}")
-
-        milo_xbox_bytes = files.get("milo_xbox", (None, None))[1]
-        milo_bytes = files.get("milo", (None, None))[1]
-
-        if milo_xbox_bytes and milo_bytes:
-            dprint(debug, "Found both milo and milo_xbox")
-        if milo_xbox_bytes:
-            (song_dest / "song.milo_xbox").write_bytes(milo_xbox_bytes)
-        if milo_bytes:
-            (song_dest / "song.milo").write_bytes(milo_bytes)
-        if not (milo_xbox_bytes or milo_bytes):
-            dprint(debug, "No milo found")
-
-        mid_bytes = files.get("mid", (None, None))[1]
-        mogg_bytes = files.get("mogg", (None, None))[1]
+        files = _collect_song_files(basename, entries, data, table_size_shift, song_dest, dump_raw, debug)
 
         dta_meta = dict(meta)
-        if mid_bytes:
-            for key, value in midi_metadata_from_bytes(mid_bytes, debug).items():
-                dta_meta.setdefault(key, value)
-            (song_dest / "notes.mid").write_bytes(mid_bytes)
 
-        # in con_extract_multi_to_folder (~line 1228):
-        song_info = _write_con_song_ini(con_path, song_dest, title, artist, dta_meta, dtaname=dtaname, dump_raw=dump_raw, debug=debug, is_multi_pack=True)
-        _write_song_assets(song_dest, mogg_bytes, debug, song_info, cancel_event=cancel_event, extract_mogg=extract_mogg)
-        (song_dest / ".extraction_complete").touch()
+        _write_extracted_song(
+            con_path=con_path,
+            song_dest=song_dest,
+            files=files,
+            title=title,
+            artist=artist,
+            dta_meta=dta_meta,
+            song_dta=song_dta,
+            dtaname=dtaname,
+            dump_raw=dump_raw,
+            debug=debug,
+            cancel_event=cancel_event,
+            extract_mogg=extract_mogg,
+            extract_png=extract_png,
+            is_multi_pack=True,
+        )
         results.append(song_dest)
         now = time.perf_counter()
         if on_song_done:
@@ -1271,7 +1425,8 @@ def con_extract_to_folder(
     overwrite: bool = False,
     cancel_event: threading.Event | None = None,
     on_song_done: Callable[[Path, float, int, int], None] | None = None,
-    extract_mogg: bool = False
+    extract_mogg: bool = False,
+    extract_png: bool = False
 ) -> Path | None:
     data = con_path.read_bytes()
     info = _stfs_parse_header(data, debug)
@@ -1285,47 +1440,42 @@ def con_extract_to_folder(
     if songs_meta:
         parent = dest_dir or Path(str(con_path) + "_extracted")
         con_extract_multi_to_folder(con_path, songs_meta, entries, data, info["table_size_shift"],
-                                    dump_raw, parent, debug, overwrite, cancel_event, on_song_done)
+                                    dump_raw, parent, debug, overwrite, cancel_event, on_song_done,
+                                    extract_mogg=extract_mogg, extract_png=extract_png)
         return parent
 
     dest_dir = _prepare_con_extraction_folder(con_path, dest_dir, debug, overwrite)
     if dest_dir is None:
         return None
-    display, files = _extract_stfs_files(data, entries, con_path, dest_dir, debug, dump_raw)
 
-    art_png_info = files.get("art_png")
-    if art_png_info:
-        name, raw = art_png_info
-        dprint(debug, f"Album art: {name} ({len(raw)} bytes)")
-        try:
-            decode_png_xbox(raw, debug).save(dest_dir / "album.png")
-            dprint(debug, "Album art extracted successfully.")
-        except Exception as e:
-            dprint(debug, f"Failed to decode album art ({name}): {e}")
+    display, files = _extract_stfs_files(
+        data,
+        entries,
+        con_path,
+        dest_dir,
+        debug,
+        dump_raw,
+    )
 
-    milo_xbox_bytes = files.get("milo_xbox", (None, None))[1]
-    milo_bytes = files.get("milo", (None, None))[1]
+    dtaname, dta_meta, song_dta = _load_dta_metadata(files, debug)
 
-    if milo_xbox_bytes and milo_bytes:
-        dprint(debug, "Found both milo and milo_xbox")
-    if milo_xbox_bytes:
-        (dest_dir / "song.milo_xbox").write_bytes(milo_xbox_bytes)
-    if milo_bytes:
-        (dest_dir / "song.milo").write_bytes(milo_bytes)
-    if not (milo_xbox_bytes or milo_bytes):
-        dprint(debug, "No milo found")
+    _write_extracted_song(
+        con_path=con_path,
+        song_dest=dest_dir,
+        files=files,
+        title=display,
+        artist=None,
+        dta_meta=dta_meta,
+        song_dta=song_dta,
+        dtaname=dtaname,
+        dump_raw=dump_raw,
+        debug=debug,
+        cancel_event=cancel_event,
+        extract_mogg=extract_mogg,
+        extract_png=extract_png,
+        is_multi_pack=False,
+    )
 
-    dtaname, dta_meta = _load_dta_metadata(files, debug)
-    mid_bytes, mogg_bytes = _load_song_assets(data, files, debug)
-
-    if mid_bytes:
-        for key, value in midi_metadata_from_bytes(mid_bytes, debug).items():
-            dta_meta.setdefault(key, value)
-        (dest_dir / "notes.mid").write_bytes(mid_bytes)
-
-    song_info = _write_con_song_ini(con_path, dest_dir, display, None, dta_meta, dtaname=dtaname, dump_raw=dump_raw, debug=debug, is_multi_pack = False)
-    _write_song_assets(dest_dir, mogg_bytes, debug, song_info, cancel_event=cancel_event, extract_mogg=extract_mogg)
-    (dest_dir / ".extraction_complete").touch()
     return dest_dir
 
 
@@ -1425,15 +1575,15 @@ def _extract_stfs_files(data: bytes, entries: list, con_path: Path, dest_dir: Pa
     return display, files
 
 
-def _load_dta_metadata(files: dict, debug: bool) -> tuple[str | None, dict]:
+def _load_dta_metadata(files: dict, debug: bool) -> tuple[str | None, dict, str]:
     dta_bytes = files.get("dta", (None, None))[1]
     if not dta_bytes:
-        return None, {}
+        return None, {}, ""
     grouped = _parse_songs_dta_grouped(dta_bytes.decode("utf-8", errors="ignore"))
     if not grouped:
-        return None, {}
+        return None, {}, ""
     dtaname, meta = next(iter(grouped.items()))
-    return dtaname, meta
+    return dtaname, meta, dta_bytes
 
 
 def _load_song_assets(data: bytes, files: dict, debug: bool) -> tuple[bytes | None, bytes | None]:
@@ -1445,16 +1595,23 @@ def _load_song_assets(data: bytes, files: dict, debug: bool) -> tuple[bytes | No
     return mid_bytes or fb_mid, mogg_bytes or fb_mogg
 
 
-def _write_song_assets(dest_dir: Path, mogg_bytes: bytes | None,
+def _write_song_dta(dest_dir: Path, song_dta: str):
+    (dest_dir / "song.mogg.dta").write_text(song_dta, encoding="utf-8")
+
+
+def _write_audio_assets(dest_dir: Path, mogg_bytes: bytes | None, song_dta: str,
                        debug: bool, song_info: dict | None, cancel_event: threading.Event | None = None,
                        extract_mogg: bool = False) -> None:
     if mogg_bytes:
         if extract_mogg:
             _split_mogg(mogg_bytes, dest_dir, debug, song_info=song_info, cancel_event=cancel_event)
         else:
-            print("[WARNING] [WARNING] MISSING DTA TO WORK")
             (dest_dir / "song.mogg").write_bytes(mogg_bytes)
-            # TODO: add dta here? since it's not needed when mogg is extracted...
+            if song_dta:
+                try:
+                    _write_song_dta(dest_dir, song_dta)
+                except:
+                    print("[WARNING] dta could not be created")
 
 
 def _write_con_song_ini(con_path: Path, dest_dir: Path,
@@ -1532,7 +1689,8 @@ def sng_extract_to_folder(
     overwrite: bool = False,
     cancel_event: threading.Event | None = None,  # ignored for now
     on_song_done: Callable[[Path, float], None] | None = None,  # ignored, one song per .sng,
-    extract_mogg: bool = False
+    extract_mogg: bool = False,
+    extract_png: bool = False
 ) -> Path:
     """Extract a .sng container to a folder."""
     dest_dir = _prepare_sng_extraction_folder(sng_path, dest_dir, overwrite, debug)
@@ -1653,7 +1811,8 @@ def pre_extract_all(
     delete_sngs: bool,
     dry_run: bool,
     dump_raw: bool,
-    extract_mogg: bool = False
+    extract_mogg: bool = False,
+    extract_png: bool = False
 ) -> dict[Path, Path]:
     """
     Pre-extract all CON/SNG files in parallel before calibration.
@@ -1704,7 +1863,8 @@ def pre_extract_all(
                         debug=debug, overwrite=overwrite,
                         cancel_event=cancel_event,
                         on_song_done=lambda song_dest, elapsed, index, total, p=pkg_path: _print_song(p, song_dest, elapsed, index, total),
-                        extract_mogg=extract_mogg
+                        extract_mogg=extract_mogg,
+                        extract_png=extract_png
                         ): (pkg_path, fmt_label, delete_file)
         for pkg_path, fmt_label, extract_fn, delete_file in jobs
     }
@@ -1803,7 +1963,8 @@ def process_library(
     overwrite: bool = False,
     skip_extracted: bool = False,
     dump_raw: bool = False,
-    extract_mogg: bool = False
+    extract_mogg: bool = False,
+    extract_png: bool = False
 ) -> None:
     print()
     t0 = time.perf_counter()
@@ -1823,10 +1984,8 @@ def process_library(
 
     cancel_event = threading.Event()
     _ = pre_extract_all(cons, sngs, overwrite, debug, workers,
-                                        cancel_event, delete_cons, delete_sngs, dry_run, dump_raw, extract_mogg=extract_mogg)
+                                        cancel_event, delete_cons, delete_sngs, dry_run, dump_raw, extract_mogg=extract_mogg, extract_png=extract_png)
     print(f"Extracted {len(cons) + len(sngs)} songs in {time.perf_counter() - t0:.0f} seconds.")
-
-# --- DTA metadata parsing (Rock Band songs.dta) ---
 
 
 # --- Entry point ---
@@ -1856,6 +2015,7 @@ def main() -> None:
     parser.add_argument("--dump-raw",                action="store_true", help="Dump all the raw files found in CON or SNG packages.")
     parser.add_argument("--shutdown-after",          action="store_true", help="Shutdown system after calibration, useful to run while sleeping.")
     parser.add_argument("--extract-mogg",            action="store_true", help="Extracts mogg files into ogg stems using ffmpeg.")
+    parser.add_argument("--extract-png",            action="store_true", help="Extracts png_xbox file into png image (broken).")
     args = parser.parse_args()
 
     if not args.library.is_dir():
@@ -1880,7 +2040,8 @@ def main() -> None:
             overwrite=args.overwrite,
             skip_extracted=args.skip_extracted,
             dump_raw=args.dump_raw,
-            extract_mogg=args.extract_mogg
+            extract_mogg=args.extract_mogg,
+            extract_png=args.extract_png
         )
     except KeyboardInterrupt:
         interrupted = True
