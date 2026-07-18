@@ -52,7 +52,7 @@ STEM_CANDIDATES = [
     "channel-01", "channel-02", "channel-03", "channel-04", "band"
 ]
 STEM_IGNORE = ["preview", "crowd"]
-EXTENSION_LIST = [".ogg", ".opus", ".mp3", ".wav"]
+EXTENSION_LIST = [".ogg", ".opus", ".mp3", ".wav", ".mogg"]
 OTHER_EXTENSIONS = [".ini", ".mid", ".bak", ".webm", ".mp4", ".png"]
 EXCLUDED_CON_SUFFIXES = frozenset(EXTENSION_LIST + OTHER_EXTENSIONS)
 
@@ -360,7 +360,8 @@ _CON_FILE_KINDS = {
     (".jpg", ".jpeg"):     "art_jpg",
     (".dta",):             "dta",
     (".bin",):             "bin",
-    (".milo_xbox",):       "milo",
+    (".milo_xbox",):       "milo_xbox",
+    (".milo",):            "milo",
     (".xvocab",):          "xvocab",
     (".voc",):             "voc",
     (".vnn",):             "vnn",
@@ -707,55 +708,43 @@ def swap_bc1_endian(data: bytes) -> bytes:
         ba[i], ba[i + 1] = ba[i + 1], ba[i]
     return bytes(ba)
 
-def find_base_size(raw: bytes, header_size=32, block_size=8):
-    total_blocks = (len(raw) - header_size) // block_size
-    for pow_diff in [0, -1]:
-        for w in [2**pow for pow in range(11, 5, -1)]:
-            h = int(w * 2**pow_diff)
-            blocks, bw, bh = 0, w, h
-            while bw >= 4 or bh >= 4:
-                wb, hb = max(1, bw // 4), max(1, bh // 4)
-                if blocks + wb * hb > total_blocks:
-                    break
-                blocks += wb * hb
-                if blocks == total_blocks:
-                    return w, h
-                bw, bh = bw // 2, bh // 2
-    raise ValueError("no matching base size found")
 
+def decode_png_xbox(raw: bytes, debug: bool) -> Image.Image:
+    '''
+    Ideal workflow (taken from YARG) that needs to be translated in this function if possible:
+     
+    public static YARGImage LoadDXT(string path) { using var data = FixedArray.LoadFile(path); return TransferDXT(data); } public static unsafe YARGImage TransferDXT(FixedArray<byte> file) { byte bitsPerPixel = file[1]; int format = *(int*) (file.Ptr + 2); bool isDXT1 = bitsPerPixel == 0x04 && format == 0x08; return new YARGImage() { _handle = file.TransferOwnership(), Data = file.Ptr + 32, Width = *(short*) (file.Ptr + 7), Height = *(short*) (file.Ptr + 9), Format = isDXT1 ? ImageFormat.DXT1 : ImageFormat.DXT5 }; }
+    '''
+    bits_per_pixel = raw[1]
+    format_value = int.from_bytes(raw[2:6], "little")
 
-def decode_png_xbox(raw: bytes, header_size=32, block_size=8) -> Image.Image:
-    # 1. Check if the raw data suggests a potential half-skip configuration
-    # Instead of guessing at the end, find the base size of the full payload first
-    width, height = find_base_size(raw, header_size, block_size)
-    
-    # 2. Extract full payload
-    image_size = (width // 4) * (height // 4) * block_size
-    full_payload = raw[header_size:header_size + image_size]
-    
-    # 3. Filter blocks (Slicing with a step [1::2] is much faster than a list comprehension loop)
-    # This grabs starting from index 1 (the 2nd block), skipping every second block
-    if height == width // 2:
-        # Instead of looping with 'if i % 2 == 1', use Python's built-in stride slicing
-        # memoryview prevents copying the bytes into memory over and over
-        mv = memoryview(full_payload)
-        blocks = [bytes(mv[i:i + block_size]) for i in range(0, len(full_payload), block_size)]
-        new_blocks = blocks[1::2] # Starts at 1, steps by 2
-        
-        # Re-verify the layout dimensions with the shortened payload size
-        # Create a dummy payload to pass to find_base_size
-        dummy_raw = b'\x00' * header_size + b''.join(new_blocks)
-        width, height = find_base_size(dummy_raw, header_size, block_size)
-    else:
-        # No skipping needed
-        pixel_data = swap_bc1_endian(full_payload)
+    is_dxt1 = bits_per_pixel == 0x04 and format_value == 0x08
+    is_dxt5 = bits_per_pixel == 0x08 and format_value == 0x18
+
+    if not (is_dxt1 or is_dxt5):
+        raise ValueError(
+            f"Unsupported PNG_XBOX format: "
+            f"bpp=0x{bits_per_pixel:02X}, format=0x{format_value:08X}"
+        )
+
+    width = int.from_bytes(raw[7:9], "little")
+    height = int.from_bytes(raw[9:11], "little")
+
+    pixel_data = raw[32:]
+
+    dprint(debug, f"Format={'BC1' if is_dxt1 else 'BC3'} size={width}x{height} data={len(pixel_data)} bytes")
+
+    pixel_data = swap_bc1_endian(pixel_data)
+    if is_dxt1:
         rgba = texture2ddecoder.decode_bc1(pixel_data, width, height)
-        return Image.frombytes("RGBA", (width, height), rgba, "raw", "BGRA")
+    else:
+        rgba = texture2ddecoder.decode_bc3(pixel_data, width, height)
 
-    # 4. Reconstruct the byte stream and swap endianness
-    pixel_data = swap_bc1_endian(b''.join(new_blocks))
-    rgba = texture2ddecoder.decode_bc1(pixel_data, width, height)
-    return Image.frombytes("RGBA", (width, height), rgba, "raw", "BGRA")
+    return Image.frombytes(
+        "RGBA",
+        (width, height),
+        rgba
+    )
 
 
 
@@ -1186,6 +1175,7 @@ def con_extract_multi_to_folder(
     overwrite: bool = False,
     cancel_event: threading.Event | None = None,
     on_song_done: Callable[[Path, float, int, int], None] | None = None,
+    extract_mogg: bool = False
 ) -> list[Path]:
     """Extract a multi-song CON pack (e.g. RBN compilation) into one subfolder
     per bundled song under dest_dir. Returns the list of per-song folders."""
@@ -1225,6 +1215,7 @@ def con_extract_multi_to_folder(
                 (song_dest / "raw").mkdir(parents=True, exist_ok=True)
                 (song_dest / "raw" / entry["name"]).write_bytes(raw)
             kind = _classify_con_entry(entry["name"])
+            print(entry["name"], kind)
             if kind == "mid":
                 _debug_check_mid(f"{basename}/{entry['name']}", raw, debug)
             if kind:
@@ -1234,9 +1225,21 @@ def con_extract_multi_to_folder(
         if art_png_info:
             name, raw = art_png_info
             try:
-                decode_png_xbox(raw).save(song_dest / "album.png")
+                decode_png_xbox(raw, debug).save(song_dest / "album.png")
             except Exception as e:
                 dprint(debug, f"Failed to decode album art ({name}): {e}")
+
+        milo_xbox_bytes = files.get("milo_xbox", (None, None))[1]
+        milo_bytes = files.get("milo", (None, None))[1]
+
+        if milo_xbox_bytes and milo_bytes:
+            dprint(debug, "Found both milo and milo_xbox")
+        if milo_xbox_bytes:
+            (song_dest / "song.milo_xbox").write_bytes(milo_xbox_bytes)
+        if milo_bytes:
+            (song_dest / "song.milo").write_bytes(milo_bytes)
+        if not (milo_xbox_bytes or milo_bytes):
+            dprint(debug, "No milo found")
 
         mid_bytes = files.get("mid", (None, None))[1]
         mogg_bytes = files.get("mogg", (None, None))[1]
@@ -1245,10 +1248,11 @@ def con_extract_multi_to_folder(
         if mid_bytes:
             for key, value in midi_metadata_from_bytes(mid_bytes, debug).items():
                 dta_meta.setdefault(key, value)
+            (song_dest / "notes.mid").write_bytes(mid_bytes)
 
         # in con_extract_multi_to_folder (~line 1228):
         song_info = _write_con_song_ini(con_path, song_dest, title, artist, dta_meta, dtaname=dtaname, dump_raw=dump_raw, debug=debug, is_multi_pack=True)
-        _write_song_assets(song_dest, mid_bytes, mogg_bytes, debug, song_info, cancel_event=cancel_event)
+        _write_song_assets(song_dest, mogg_bytes, debug, song_info, cancel_event=cancel_event, extract_mogg=extract_mogg)
         (song_dest / ".extraction_complete").touch()
         results.append(song_dest)
         now = time.perf_counter()
@@ -1267,10 +1271,14 @@ def con_extract_to_folder(
     overwrite: bool = False,
     cancel_event: threading.Event | None = None,
     on_song_done: Callable[[Path, float, int, int], None] | None = None,
+    extract_mogg: bool = False
 ) -> Path | None:
     data = con_path.read_bytes()
     info = _stfs_parse_header(data, debug)
     entries = _stfs_list_files(data, info, debug)
+
+    file_types = sorted([entry['name'].split('.')[-1] for entry in entries])
+    dprint(debug, f"{len(entries)} files found with types: {list(dict.fromkeys(file_types))}")
 
     # For RB1 export, entries is missing all the png stuff
     songs_meta = _find_multi_song_dta(entries, data, info["table_size_shift"], debug)
@@ -1290,21 +1298,33 @@ def con_extract_to_folder(
         name, raw = art_png_info
         dprint(debug, f"Album art: {name} ({len(raw)} bytes)")
         try:
-            decode_png_xbox(raw).save(dest_dir / "album.png")
+            decode_png_xbox(raw, debug).save(dest_dir / "album.png")
             dprint(debug, "Album art extracted successfully.")
         except Exception as e:
             dprint(debug, f"Failed to decode album art ({name}): {e}")
 
-    # in con_extract_to_folder (~line 1275-1282):
+    milo_xbox_bytes = files.get("milo_xbox", (None, None))[1]
+    milo_bytes = files.get("milo", (None, None))[1]
+
+    if milo_xbox_bytes and milo_bytes:
+        dprint(debug, "Found both milo and milo_xbox")
+    if milo_xbox_bytes:
+        (dest_dir / "song.milo_xbox").write_bytes(milo_xbox_bytes)
+    if milo_bytes:
+        (dest_dir / "song.milo").write_bytes(milo_bytes)
+    if not (milo_xbox_bytes or milo_bytes):
+        dprint(debug, "No milo found")
+
     dtaname, dta_meta = _load_dta_metadata(files, debug)
     mid_bytes, mogg_bytes = _load_song_assets(data, files, debug)
 
     if mid_bytes:
         for key, value in midi_metadata_from_bytes(mid_bytes, debug).items():
             dta_meta.setdefault(key, value)
+        (dest_dir / "notes.mid").write_bytes(mid_bytes)
 
     song_info = _write_con_song_ini(con_path, dest_dir, display, None, dta_meta, dtaname=dtaname, dump_raw=dump_raw, debug=debug, is_multi_pack = False)
-    _write_song_assets(dest_dir, mid_bytes, mogg_bytes, debug, song_info, cancel_event=cancel_event)
+    _write_song_assets(dest_dir, mogg_bytes, debug, song_info, cancel_event=cancel_event, extract_mogg=extract_mogg)
     (dest_dir / ".extraction_complete").touch()
     return dest_dir
 
@@ -1425,12 +1445,16 @@ def _load_song_assets(data: bytes, files: dict, debug: bool) -> tuple[bytes | No
     return mid_bytes or fb_mid, mogg_bytes or fb_mogg
 
 
-def _write_song_assets(dest_dir: Path, mid_bytes: bytes | None, mogg_bytes: bytes | None,
-                       debug: bool, song_info: dict | None, cancel_event: threading.Event | None = None) -> None:
-    if mid_bytes:
-        (dest_dir / "notes.mid").write_bytes(mid_bytes)
+def _write_song_assets(dest_dir: Path, mogg_bytes: bytes | None,
+                       debug: bool, song_info: dict | None, cancel_event: threading.Event | None = None,
+                       extract_mogg: bool = False) -> None:
     if mogg_bytes:
-        _split_mogg(mogg_bytes, dest_dir, debug, song_info=song_info, cancel_event=cancel_event)
+        if extract_mogg:
+            _split_mogg(mogg_bytes, dest_dir, debug, song_info=song_info, cancel_event=cancel_event)
+        else:
+            print("[WARNING] [WARNING] MISSING DTA TO WORK")
+            (dest_dir / "song.mogg").write_bytes(mogg_bytes)
+            # TODO: add dta here? since it's not needed when mogg is extracted...
 
 
 def _write_con_song_ini(con_path: Path, dest_dir: Path,
@@ -1507,7 +1531,8 @@ def sng_extract_to_folder(
     debug: bool = False,
     overwrite: bool = False,
     cancel_event: threading.Event | None = None,  # ignored for now
-    on_song_done: Callable[[Path, float], None] | None = None,  # ignored, one song per .sng
+    on_song_done: Callable[[Path, float], None] | None = None,  # ignored, one song per .sng,
+    extract_mogg: bool = False
 ) -> Path:
     """Extract a .sng container to a folder."""
     dest_dir = _prepare_sng_extraction_folder(sng_path, dest_dir, overwrite, debug)
@@ -1627,7 +1652,8 @@ def pre_extract_all(
     delete_cons: bool,
     delete_sngs: bool,
     dry_run: bool,
-    dump_raw: bool
+    dump_raw: bool,
+    extract_mogg: bool = False
 ) -> dict[Path, Path]:
     """
     Pre-extract all CON/SNG files in parallel before calibration.
@@ -1677,7 +1703,8 @@ def pre_extract_all(
         executor.submit(_timed_extract, extract_fn, pkg_path, dump_raw=dump_raw,
                         debug=debug, overwrite=overwrite,
                         cancel_event=cancel_event,
-                        on_song_done=lambda song_dest, elapsed, index, total, p=pkg_path: _print_song(p, song_dest, elapsed, index, total)
+                        on_song_done=lambda song_dest, elapsed, index, total, p=pkg_path: _print_song(p, song_dest, elapsed, index, total),
+                        extract_mogg=extract_mogg
                         ): (pkg_path, fmt_label, delete_file)
         for pkg_path, fmt_label, extract_fn, delete_file in jobs
     }
@@ -1775,7 +1802,8 @@ def process_library(
     delete_sngs: bool = False,
     overwrite: bool = False,
     skip_extracted: bool = False,
-    dump_raw: bool = False
+    dump_raw: bool = False,
+    extract_mogg: bool = False
 ) -> None:
     print()
     t0 = time.perf_counter()
@@ -1795,7 +1823,7 @@ def process_library(
 
     cancel_event = threading.Event()
     _ = pre_extract_all(cons, sngs, overwrite, debug, workers,
-                                        cancel_event, delete_cons, delete_sngs, dry_run, dump_raw)
+                                        cancel_event, delete_cons, delete_sngs, dry_run, dump_raw, extract_mogg=extract_mogg)
     print(f"Extracted {len(cons) + len(sngs)} songs in {time.perf_counter() - t0:.0f} seconds.")
 
 # --- DTA metadata parsing (Rock Band songs.dta) ---
@@ -1827,6 +1855,7 @@ def main() -> None:
     parser.add_argument("--skip-extracted",          action="store_true", help="Skip all song folders that were extracted from CON or SNG files.")
     parser.add_argument("--dump-raw",                action="store_true", help="Dump all the raw files found in CON or SNG packages.")
     parser.add_argument("--shutdown-after",          action="store_true", help="Shutdown system after calibration, useful to run while sleeping.")
+    parser.add_argument("--extract-mogg",            action="store_true", help="Extracts mogg files into ogg stems using ffmpeg.")
     args = parser.parse_args()
 
     if not args.library.is_dir():
@@ -1850,7 +1879,8 @@ def main() -> None:
             delete_sngs=args.delete_sngs,
             overwrite=args.overwrite,
             skip_extracted=args.skip_extracted,
-            dump_raw=args.dump_raw
+            dump_raw=args.dump_raw,
+            extract_mogg=args.extract_mogg
         )
     except KeyboardInterrupt:
         interrupted = True
