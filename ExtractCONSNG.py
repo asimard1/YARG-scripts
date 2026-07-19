@@ -1339,7 +1339,7 @@ def _collect_song_files(
             (song_dest / "raw").mkdir(parents=True, exist_ok=True)
             (song_dest / "raw" / entry["name"]).write_bytes(raw)
         kind = _classify_con_entry(entry["name"])
-        dprint(debug, f"{entry["name"]}, {kind}")
+        dprint(debug, f"{entry['name']}, {kind}")
         if kind == "mid":
             _debug_check_mid(f"{basename}/{entry['name']}", raw, debug)
         if kind:
@@ -1579,11 +1579,12 @@ def _load_dta_metadata(files: dict, debug: bool) -> tuple[str | None, dict, str]
     dta_bytes = files.get("dta", (None, None))[1]
     if not dta_bytes:
         return None, {}, ""
-    grouped = _parse_songs_dta_grouped(dta_bytes.decode("utf-8", errors="ignore"))
+    dta_text = dta_bytes.decode("utf-8", errors="ignore")
+    grouped = _parse_songs_dta_grouped(dta_text)
     if not grouped:
         return None, {}, ""
     dtaname, meta = next(iter(grouped.items()))
-    return dtaname, meta, dta_bytes
+    return dtaname, meta, dta_text
 
 
 def _load_song_assets(data: bytes, files: dict, debug: bool) -> tuple[bytes | None, bytes | None]:
@@ -1610,8 +1611,8 @@ def _write_audio_assets(dest_dir: Path, mogg_bytes: bytes | None, song_dta: str,
             if song_dta:
                 try:
                     _write_song_dta(dest_dir, song_dta)
-                except:
-                    print("[WARNING] dta could not be created")
+                except Exception as e:
+                    print(f"[WARNING] dta could not be created, {dest_dir}: {e}")
 
 
 def _write_con_song_ini(con_path: Path, dest_dir: Path,
@@ -1894,7 +1895,6 @@ def pre_extract_all(
                     and any(d.is_dir() and (d / "song.ini").exists() for d in song_folder.iterdir())
                 )
 
-                print("is_multi_song:", is_multi_song)
                 if is_multi_song:
                     song_subfolders = [d for d in song_folder.iterdir() if d.is_dir() and (d / "song.ini").exists()]
                     nb_songs_extracted = len(song_subfolders)
