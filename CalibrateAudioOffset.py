@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 yarg_sync.py — Auto-calibrate song.ini delay values for YARG song libraries.
 
@@ -17,15 +18,6 @@ Usage:
 Output per song: song.ini updated, yarg_sync_list.json updated with delay+confidence.
 
 Dependencies: pip install librosa numpy soundfile scipy pillow texture2ddecoder
-"""
-
-"""
-List of songs that don't get well calibrated (in my personnal library, I'll remove this is sent to others)
-All of GH Live (e.g. I computed 3615, 9830 and 6875 ms of delay for three songs, as charts start with intro)
-Couldn't test any of the GH TV songs at all since it only has 6 fret guitar and YARG doesn't support it yet
-The Jackson 5 - ABC (RB2 DLC) (Should add 11 more)
-
-And still counting...
 """
 
 # --- Startup: single-thread C libs BEFORE numpy/librosa/scipy initialize ---
@@ -49,24 +41,35 @@ try:
     import sys
     import threading
     import time
+    import tempfile
     from concurrent.futures import ThreadPoolExecutor
     from pathlib import Path
     from typing import Any
+    import hashlib
+    from threading import Lock
+    import gc
     import shutil
-    from PIL import Image
-    import texture2ddecoder
-
     import numpy as np
     import librosa
     import soundfile as sf
-    from scipy.signal import butter, sosfiltfilt
+    import scipy.signal as spsignal
     import ExtractCONSNG
 except ImportError as e:
-    pkg = str(e).split("'")[-2] if "'" in str(e) else "required dependencies"
-    print(f"Error: Could not import {pkg}.")
+    pkg = getattr(e, "name", None)
+
+    print(f"Error: {e}")
     print("-" * 40)
-    print("Please install the required libraries by running:")
-    print("pip install librosa numpy soundfile scipy")
+
+    if pkg == "ExtractCONSNG":
+        print("Could not find the local module 'ExtractCONSNG.py'.")
+        print("Make sure it is in the same folder as this script.")
+    else:
+        print("One or more required Python packages are missing.")
+        print("Install them with:")
+        print()
+        print("python -m pip install librosa numpy soundfile scipy pillow texture2ddecoder")
+        print()
+
     print("-" * 40)
     sys.exit(1)
 
@@ -74,7 +77,7 @@ except ImportError as e:
 # --- Constants ---
 
 # Delay search
-MAX_DELAY_MS = 100     # initial search range (ms)
+MAX_DELAY_MS = 200     # initial search range (ms)
 COARSE_STEP = 3        # coarse scan spacing before fine refinement
 FINE_STEP = 1          # fine scan spacing
 EXTEND_LIMIT = 5       # can extend to ±(EXTEND_LIMIT × MAX_DELAY_MS)
@@ -82,17 +85,28 @@ TOLERANCE_MS = 15      # onset match window (ms) — overridden by --tolerance
 SOFT_SCORE_POWER = 2   # parameter to control the shape of the soft score curve
 HOP_LENGTH = 512       # librosa hop length for onset detection — overridden by --hop-length
 BOUNDARY_BONUS = False # whether to apply extra weight to first/last 5% of chart notes
-BOUNDARY_PCT = 0.05    # fraction of notes at each end that receive the boundary bonus
+BOUNDARY_PCT = 0.02    # fraction of notes at each end that receive the boundary bonus
 STREAK_BONUS = False   # whether to apply a multiplier to notes that are isolated
-STREAK_BASE = 5.0     # the base of the sigmoid used (\frac{1-a^{-x}}{1+a^{-x}})
+STREAK_BASE = 5.0     # the base of the sigmoid used (\frac{1-a^{-x}}{1+a^{-x}}*(a+1)/(a-1)) TODO: ?? I THINK ??
 
 # Audio - lowpass emphasizes kick/bass onsets; HPSS isolates percussive transients
 LOWPASS_HZ = 200     # lowpass cutoff
 SR = 22050           # target sample rate
-AUDIO_CLIP_S = 1800  # max seconds of audio to read (None = unlimited)
+AUDIO_CLIP_S = 1800  # max seconds of audio to read (None = unlimited) (1800 = 30 minutes)
 
 # Display / runtime
-MAX_SONG_NAME = 40
+MAX_SONG_NAME = 30
+USE_INI = True
+if os.name == 'nt':
+    APPDATA_ROAMING = Path(os.environ["APPDATA"])
+    MODIF_PATH = APPDATA_ROAMING.parent / 'LocalLow' / 'YARC' / 'YARG' / 'nightly' / 'song_offsets.json'
+    print('Json file for offsets exists:', MODIF_PATH.is_file())
+    if MODIF_PATH.is_file():
+        USE_INI = False
+else:
+    MODIF_PATH = None
+    print("You are running a non-Windows OS.")
+print(f'Path for values: {MODIF_PATH}, Use ini files: {USE_INI}.')
 LIST_PATH = Path(__file__).parent / "yarg_sync_list.json"
 WORKER_THREADS = 6
 ETA_EMA_ALPHA = 0.1
@@ -100,12 +114,6 @@ ETA_EMA_ALPHA = 0.1
 # File format magic bytes
 CON_MAGIC = b"CON "
 SNG_MAGIC = b"SNGPKG"
-STEM_CANDIDATES = [
-    "bass", "drums", "drum", "drums_1", "drums_2", "drums_3", "drums_4",
-    "rhythm", "guitar", "keys", "vocals", "backing", "song", "ssong",
-    "channel-01", "channel-02", "channel-03", "channel-04", "band"
-]
-STEM_IGNORE = ["preview", "crowd"]
 EXTENSION_LIST = [".ogg", ".opus", ".mp3", ".wav"]
 OTHER_EXTENSIONS = [".ini", ".mid", ".bak", ".webm", ".mp4", ".png"]
 EXCLUDED_CON_SUFFIXES = frozenset(EXTENSION_LIST + OTHER_EXTENSIONS)
@@ -116,6 +124,9 @@ _STFS_BASE = 0xC000   # data area start; block 0 is always at 0xC000
 
 # Thresholds
 TOTAL_PCT_MIN = 0.1  # overridden to 0.2 in hard-score mode
+
+CACHE_PATH = Path(__file__).parent / ".mogg_cache"
+CACHE_PATH.mkdir(parents=True, exist_ok=True)
 
 
 # --- Terminal color ---
@@ -180,6 +191,25 @@ def format_score_percentage(score: float, needed: float, nb_onsets: int, total: 
 
 # --- JSON list helpers (yarg_sync_list.json) ---
 
+def load_hash_list() -> dict[str, int]:
+    print(f"Checking for existing entries in {MODIF_PATH}...")
+    if not MODIF_PATH.exists():
+        print(f"No existing list file found at {MODIF_PATH}. Starting fresh.")
+        return {}
+    try:
+        with MODIF_PATH.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        print(f"Found {len(data)} existing entries in the {MODIF_PATH.name} file. (Last: {list(data.keys())[-1]})")
+        for i, x in enumerate(data):
+            print(x, data[x])
+            if i > 3-2: # print only 3 values
+                print('...\n')
+                break
+        return data
+    except Exception as e:
+        print(red(f"Error reading list file: {e}. Starting fresh."))
+        return {}
+
 def load_list() -> dict[str, Any]:
     print(f"Checking for existing entries in {LIST_PATH}...")
     if not LIST_PATH.exists():
@@ -188,7 +218,12 @@ def load_list() -> dict[str, Any]:
     try:
         with LIST_PATH.open("r", encoding="utf-8") as f:
             data = json.load(f)
-        print(f"Found {len(data)} existing entries in the list file.")
+        print(f"Found {len(data)} existing entries in the {LIST_PATH.name} file.")
+        for i, x in enumerate(data):
+            print(x, data[x])
+            if i > 3-2: # print only 3 values
+                print('...\n')
+                break
         return data
     except Exception as e:
         print(red(f"Error reading list file: {e}. Starting fresh."))
@@ -231,8 +266,9 @@ def count_audio_files(debug: bool, always_print: bool, songs: list[Path] | None 
     if songs is None:
         return count
     for ini_path in songs:
-        count += len(ExtractCONSNG.find_audio_candidates(ini_path.parent))
-    
+        folder = ini_path.parent
+        count += 1 if any(folder.glob('*.mogg')) else sum(len(list(folder.glob(f'*{extension}'))) for extension in EXTENSION_LIST)
+
     dprint(debug, f"Number of audio files to process: {count}", always_print=always_print)
     return count
 
@@ -306,22 +342,53 @@ def get_song_list(
 
 # --- Audio filtering ---
 
-_LOWPASS_SOS = butter(4, LOWPASS_HZ / (SR / 2), btype="low", output="sos")
+_LOWPASS_SOS = spsignal.butter(4, LOWPASS_HZ / (SR / 2), btype="low", output="sos")
 
 
 def apply_lowpass(y: np.ndarray) -> tuple[str, np.ndarray]:
     try:
-        return "lowpass", sosfiltfilt(_LOWPASS_SOS, y).astype(np.float32)
+        return "lowpass", np.asarray(spsignal.sosfiltfilt(_LOWPASS_SOS, y), dtype=np.float32)
     except Exception:
         return "lowpass", y
 
 
-def apply_percussive(y: np.ndarray) -> tuple[str, np.ndarray]:
-    try:
-        perc = librosa.effects.hpss(y)[1]
-        return "percussive", perc.astype(np.float32)
-    except Exception:
-        return "percussive", y
+def _mogg_candidates(
+    folder: Path,
+    debug: bool,
+) -> tuple[list[Path], str]:
+    """Extract the preferred MOGG into a cached folder and return its parts."""
+    mogg_files = sorted(folder.glob("*.mogg"))
+    if not mogg_files:
+        return [], ''
+
+    mogg_path = mogg_files[0]
+    dta_path = Path(str(mogg_path) + ".dta")
+    song_info = None
+
+    if dta_path.is_file():
+        try:
+            dta_text = dta_path.read_text(encoding="utf-8", errors="ignore")
+            grouped = ExtractCONSNG._parse_songs_dta_grouped(dta_text)
+            metadata = next(iter(grouped.values()), None)
+            song_info = metadata.get("song") if isinstance(metadata, dict) else None
+        except Exception as exc:
+            dprint(debug, f"Could not parse MOGG DTA {dta_path.name}: {exc}")
+
+    hash_value = hashlib.sha1(mogg_path.read_bytes()).hexdigest().upper()
+    cache_folder = CACHE_PATH / hash_value
+    cache_folder.mkdir(parents=True, exist_ok=True)
+
+    ExtractCONSNG._split_mogg(
+        mogg_path.read_bytes(),
+        cache_folder,
+        debug,
+        song_info=song_info,
+        output_format="wav",
+    )
+
+    candidates = ExtractCONSNG.find_audio_candidates(cache_folder)
+
+    return candidates, hash_value
 
 
 # --- Chart parsing — .chart format ---
@@ -372,11 +439,14 @@ _CHART_DIFF_PREFIXES = ("Expert", "Hard", "Medium", "Easy")
 _CHART_SKIP_SECTIONS = {"Song", "SyncTrack", "Events"}
 
 
-def notes_from_chart(chart_path: Path) -> dict[str, np.ndarray]:
+def notes_from_chart(chart_path: Path) -> tuple[dict[str, np.ndarray], str]:
     """Parse a .chart file and return a dict of MIDI-style part name -> ms timestamps,
     so that midi_parts_for_stem() can do stem-matched calibration just like for .mid files."""
     try:
         text = chart_path.read_text(encoding="utf-8", errors="replace")
+        with open(chart_path, "rb") as f:
+            # Compute the SHA-256 digest directly from the file object
+            hash_value = hashlib.file_digest(f, "sha1").hexdigest().upper()
         resolution = _parse_resolution(text)
         bpm_map = _parse_bpm_map(text)
         sections = {m.group(1): m.group(2)
@@ -399,9 +469,9 @@ def notes_from_chart(chart_path: Path) -> dict[str, np.ndarray]:
         return {
             part: _ticks_to_ms(np.array(sorted(ticks), dtype=np.float64), resolution, bpm_map)
             for part, ticks in part_ticks.items()
-        }
+        }, hash_value
     except Exception:
-        return {}
+        return {}, ""
 
 
 # --- Chart parsing — MIDI format ---
@@ -483,11 +553,14 @@ def _parse_midi_file(data: bytes) -> tuple[int, list, list] | None:
     return tpq, bpm_map, all_tracks
 
 
-def notes_from_mid(mid_path: Path, debug: bool) -> dict[str, np.ndarray]:
+def notes_from_mid(mid_path: Path, debug: bool) -> tuple[dict[str, np.ndarray], str]:
     try:
         parsed = _parse_midi_file(mid_path.read_bytes())
+        with open(mid_path, "rb") as f:
+            # Compute the SHA-256 digest directly from the file object
+            hash_value = hashlib.file_digest(f, "sha1").hexdigest().upper()
         if parsed is None:
-            return {}
+            return {}, ""
         tpq, bpm_map, all_tracks = parsed
         result: dict[str, np.ndarray] = {}
         for track_events in all_tracks[1:]:
@@ -501,82 +574,78 @@ def notes_from_mid(mid_path: Path, debug: bool) -> dict[str, np.ndarray]:
             if note_ticks and name_bytes is not None:
                 part = name_bytes.decode("utf-8", errors="replace")
                 result[part] = _ticks_to_ms(np.array(sorted(note_ticks), dtype=np.float64), tpq, bpm_map)
-        return result
+        return result, hash_value
     except Exception as e:
         dprint(debug, f"exception in notes_from_mid: {e}")
-        return {}
-
-
-
-
-
-
+        return {}, ""
 
 
 # --- MIDI part selection per stem ---
 
-_STEM_EXTRA_PART: dict[str, str] = {
-    "guitar": "PART GUITAR",
-    "keys":   "PART KEYS",
-    "vocals": "PART VOCALS",
+_STEM_ALIASES = {
+    "bass": "bass",
+    "drum": "drums",
+    "drums": "drums",
+    "guitar": "guitar",
+    "keys": "keys",
+    "vocals": "vocals",
+    "rhythm": "rhythm",
+    "backing": "backing",
+    "song": "backing",
 }
-_STEM_BASE_ONLY = {"bass", "drums", "drums_1", "drums_2", "drums_3", "drums_4", "rhythm"}
+
+
+def _normalized_part_name(name: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "", name.lower())
+    normalized = re.sub(r"\d+$", "", normalized)
+    if normalized.startswith("part"):
+        normalized = normalized[4:]
+    if normalized.startswith("real"):
+        normalized = normalized[4:]
+    if normalized.endswith("coop"):
+        normalized = normalized[:-4]
+    return normalized
 
 
 def midi_parts_for_stem(stem_name: str, parts: dict[str, np.ndarray]) -> np.ndarray:
-    # Prefer instrument-specific note tracks when they contain enough notes.
-    # Otherwise fall back to all playable parts to maximize calibration accuracy.
-    MIN_NOTES = 20
-    EXCLUDED_PARTS = {"VENUE", "BEAT", "EVENTS"}
-    BASE_PARTS = {"PART DRUMS", "PART BASS", "PART RHYTHM"}
-
-    def combine(names: set[str]) -> np.ndarray:
-        arrays = [v for k, v in parts.items() if k in names]
-        return np.unique(np.concatenate(arrays)) if arrays else np.array([])
-
-    base = combine(BASE_PARTS)
-    lower = stem_name.lower()
-
-    if lower in _STEM_BASE_ONLY:
-        if len(base) >= MIN_NOTES:
-            return base
-    elif lower in _STEM_EXTRA_PART:
-        extra = parts.get(_STEM_EXTRA_PART[lower], np.array([]))
-        combined = np.unique(np.concatenate([base, extra])) if len(extra) else base
-        if len(combined) >= MIN_NOTES:
-            return combined
-
-    all_parts = [v for k, v in parts.items() if k not in EXCLUDED_PARTS]
-    return np.unique(np.concatenate(all_parts)) if all_parts else np.array([])
+    stem_key = _STEM_ALIASES.get(_normalized_part_name(stem_name))
+    for part_name, note_times in parts.items():
+        part_key = _normalized_part_name(part_name)
+        if stem_key is not None:
+            if part_key == stem_key:
+                return note_times
+        elif part_key == _normalized_part_name(stem_name):
+            return note_times
+    return np.array([])
 
 
 # --- Chart notes entry point ---
 
-def get_chart_notes(folder: Path, debug: bool) -> tuple[dict[str, np.ndarray], str]:
+def get_chart_notes(folder: Path, debug: bool) -> tuple[dict[str, np.ndarray], str, str]:
     """Return chart notes as a dict of part name -> ms timestamps, and an error reason string.
     Both .chart and .mid return dicts so that midi_parts_for_stem() applies to both."""
     chart = folder / "notes.chart"
     mid = folder / "notes.mid"
 
     if not chart.exists() and not mid.exists():
-        return {}, "no notes.chart or notes.mid found"
+        return {}, "no notes.chart or notes.mid found", ""
 
     if chart.exists():
-        parts = notes_from_chart(chart)
+        parts, hash_value = notes_from_chart(chart)
         if parts:
             all_times = np.unique(np.concatenate(list(parts.values())))
             if len(all_times) >= 8:
-                return parts, ""
+                return parts, "", hash_value
 
     if mid.exists():
-        parts = notes_from_mid(mid, debug)
+        parts, hash_value = notes_from_mid(mid, debug)
         if parts:
             all_times = np.unique(np.concatenate(list(parts.values())))
             if len(all_times) >= 8:
-                return parts, ""
-            return {}, f"too few notes in chart ({len(all_times)}) to accurately calibrate (minimum is 8)"
+                return parts, "", hash_value
+            return {}, f"too few notes in chart ({len(all_times)}) to accurately calibrate (minimum is 8)", ""
 
-    return {}, "no usable chart notes found"
+    return {}, "no usable chart notes found", ""
 
 
 
@@ -639,18 +708,15 @@ def _get_streak_nbs(dist_ms: np.ndarray) -> np.ndarray:
     successes = _nearest_onset_mask(dist_ms)
     streak_nbs = np.ones(successes.size, dtype=int)
 
-    if not successes.any():
-        return streak_nbs
+    if successes.any():
+        idx = np.flatnonzero(successes)
+        breaks = np.where(np.diff(idx) != 1)[0]
 
-    # Indices of successful notes
-    idx = np.flatnonzero(successes)
-    # Find breaks between consecutive successful notes
-    breaks = np.where(np.diff(idx) != 1)[0]
+        starts = np.r_[0, breaks + 1]
+        ends = np.r_[breaks + 1, len(idx)]
 
-    starts = np.r_[0, breaks + 1]
-    ends   = np.r_[breaks + 1, len(idx)]
-    for s, e in zip(starts, ends):
-        streak_nbs[idx[s:e]] = e - s
+        for s, e in zip(starts, ends):
+            streak_nbs[idx[s:e]] = e - s
 
     return streak_nbs
 
@@ -684,7 +750,7 @@ def _soft_weight(dist_ms: np.ndarray, debug: bool) -> np.ndarray:
 
 
 def _hard_weight(dist_ms: np.ndarray, debug: bool) -> np.ndarray:
-    return _nearest_onset_mask(dist_ms).astype(float)
+    return np.asarray(_nearest_onset_mask(dist_ms), dtype=np.float32)
 
 
 def _soft_score_at(chart_notes_ms: np.ndarray,
@@ -756,7 +822,7 @@ def _score_delays(
 
     scores = weights.sum(axis=1)
 
-    if BOUNDARY_BONUS:
+    if BOUNDARY_BONUS and bmask is not None:
         scores += _boundary_bonus_weight(dist[:, bmask]).sum(axis=1)
 
     return scores
@@ -856,6 +922,64 @@ def _explain_score(
         "duplicate_matches": duplicate_matches,
         "max_onset_reuse": max_reuse,
     }
+
+
+def _explain_grouped_score(
+    audio_onsets_groups: list[np.ndarray],
+    chart_notes_groups: list[np.ndarray],
+    delay: int,
+    hard_score: bool,
+) -> dict:
+    """Combine score diagnostics without allowing groups to cross-match."""
+    details = [
+        _explain_score(audio, chart, delay, hard_score)
+        for audio, chart in zip(audio_onsets_groups, chart_notes_groups)
+    ]
+    if not details:
+        return _explain_score(np.array([0.0]), np.array([0.0]), delay, hard_score)
+
+    total_matches = sum(item["notes_within_tolerance"] for item in details)
+    average_error = sum(
+        item["average_error"] * item["notes_within_tolerance"]
+        for item in details
+        if item["average_error"] is not None
+    ) / total_matches if total_matches else None
+    return {
+        "score": sum(item["score"] for item in details),
+        "base_score": sum(item["base_score"] for item in details),
+        "streak_bonus": sum(item["streak_bonus"] for item in details),
+        "notes_within_tolerance": total_matches,
+        "total_notes": sum(item["total_notes"] for item in details),
+        "perfect_matches": sum(item["perfect_matches"] for item in details),
+        "good_matches": sum(item["good_matches"] for item in details),
+        "acceptable_matches": sum(item["acceptable_matches"] for item in details),
+        "misses": sum(item["misses"] for item in details),
+        "average_error": average_error,
+        "median_error": average_error,
+        "max_error": max(
+            (item["max_error"] for item in details if item["max_error"] is not None),
+            default=None,
+        ),
+        "unique_onsets_used": sum(item["unique_onsets_used"] for item in details),
+        "duplicate_matches": sum(item["duplicate_matches"] for item in details),
+        "max_onset_reuse": max(item["max_onset_reuse"] for item in details),
+    }
+
+
+def _explain_candidate_score(candidate: dict, delay: int, hard_score: bool) -> dict:
+    if candidate.get("grouped"):
+        return _explain_grouped_score(
+            candidate["audio_onsets_ms"],
+            candidate["chart_notes_ms"],
+            delay,
+            hard_score,
+        )
+    return _explain_score(
+        candidate["audio_onsets_ms"],
+        candidate["chart_notes_ms"],
+        delay,
+        hard_score,
+    )
 
 
 def _compare_delays(
@@ -1175,22 +1299,103 @@ def write_delay(ini_path: Path, new_delay: int, had_delay_key: bool) -> None:
     ini_path.write_text(new_text, encoding="utf-8")
 
 
+def write_delay_hash(hash_value: str, existing_hash: dict, delay: int) -> None:
+    """Write the delay value to the json file in MODIF_PATH"""
+    existing_hash[hash_value] = delay
+
+
+def remove_delay_hash(hash_value: str, existing_hash: dict) -> None:
+    """Remove the delay value from the json file in MODIF_PATH"""
+    if hash_value in existing_hash:
+        del existing_hash[hash_value]
+
+
 # ---------------------------------------------------------------------------
 # ETA computation
 # ---------------------------------------------------------------------------
 
-def compute_eta(start_time: float, avg_time: float, total_audios: int,
-                counter_audios: int, current_audios: int, debug: bool,
-                sample_elapsed: float | None = None, workers: int = 1) -> tuple[str, float]:
-    if current_audios > 0:
-        raw = sample_elapsed if sample_elapsed is not None else time.perf_counter() - start_time
-        sample = raw / current_audios
-        avg_time = sample if avg_time < 0 else avg_time * (1 - ETA_EMA_ALPHA) + sample * ETA_EMA_ALPHA
-    remaining = total_audios - counter_audios
-    eta_sec = int(avg_time * remaining  / workers) if avg_time > 0 and remaining > 0 else 0
-    eta_m, eta_s = divmod(eta_sec, 60)
-    eta_h, eta_m = divmod(eta_m, 60)
-    return dim(f"  [{eta_h}h{eta_m}m{eta_s:02}s left, {avg_time:.1f}s/audio]"), avg_time
+"""
+Drop-in replacement for compute_eta() in CalibrateAudioOffset.py.
+
+Root cause of the old function's flakiness: it modeled ETA as
+    avg_time_per_item * remaining / workers
+using a per-song self-reported "elapsed" sample blended into an EMA. That
+model breaks whenever the assumptions don't hold — and they rarely do:
+  - `workers` assumes perfect parallel scaling. False near the end of a run
+    (fewer remaining items than workers) and false whenever a song is slow
+    enough to stall other threads.
+  - The EMA is seeded 100% from the very first sample (avg_time = sample),
+    so one slow/unrepresentative first song poisons the ETA for a while.
+  - Every sample gets equal EMA weight regardless of how much work it
+    represents (current_audios varies a lot between songs), so a single
+    heavy song can swing the average as much as ten light ones.
+  - "skip" results (fast, trivial) and full analysis runs (slow) feed the
+    same average, so the mix ratio of skips vs. real work silently shifts
+    the ETA.
+
+This version instead measures observed wall-clock throughput
+(items completed / real elapsed time). That number is *inherently*
+concurrency-aware — if 6 workers are actually busy, the completions-per-
+second naturally reflects that; no `/ workers` fudge needed, and no
+assumption that all workers stay saturated.
+"""
+
+
+class ETATracker:
+    """Wall-clock-throughput ETA. Call update(done) each time progress is made."""
+
+    def __init__(self, total: int, window_s: float = 2.0, alpha: float = 0.2):
+        self.total = total
+        self.window_s = window_s   # min real time between throughput samples
+        self.alpha = alpha         # EMA weight for new windowed samples
+        now = time.perf_counter()
+        self.start = now
+        self._win_t = now
+        self._win_n = 0            # `done` count at start of current window
+        self.rate: float | None = None   # smoothed items/sec
+
+    def update(self, done: int) -> str:
+        now = time.perf_counter()
+        window_elapsed = now - self._win_t
+
+        # Only fold in a new throughput sample once a real time window has
+        # passed — this is what makes it immune to bursty completions (e.g.
+        # several futures unblocking back-to-back) and to any one item's
+        # duration dominating the estimate.
+        if window_elapsed >= self.window_s and done > self._win_n:
+            window_rate = (done - self._win_n) / window_elapsed
+            self.rate = (
+                window_rate if self.rate is None
+                else self.rate * (1 - self.alpha) + window_rate * self.alpha
+            )
+            self._win_t, self._win_n = now, done
+
+        # Bootstrap phase (before the first full window): fall back to the
+        # cumulative average instead of guessing from a single sample.
+        rate = self.rate
+        if rate is None:
+            elapsed = now - self.start
+            rate = done / elapsed if elapsed > 0 else 0.0
+
+        remaining = max(self.total - done, 0)
+        eta_sec = int(remaining / rate) if rate > 0 else 0
+        h, rem = divmod(eta_sec, 3600)
+        m, s = divmod(rem, 60)
+        per_item = f"{1 / rate:.1f}s/audio" if rate > 0 else "…"
+        return f"  [{h}h{m}m{s:02}s left, {per_item}]"
+
+# def compute_eta(start_time: float, avg_time: float, total_audios: int,
+#                 counter_audios: int, current_audios: int, debug: bool,
+#                 sample_elapsed: float | None = None, workers: int = 1) -> tuple[str, float]:
+#     if current_audios > 0:
+#         raw = sample_elapsed if sample_elapsed is not None else time.perf_counter() - start_time
+#         sample = raw / current_audios
+#         avg_time = sample if avg_time < 0 else avg_time * (1 - ETA_EMA_ALPHA) + sample * ETA_EMA_ALPHA
+#     remaining = total_audios - counter_audios
+#     eta_sec = int(avg_time * remaining  / workers) if avg_time > 0 and remaining > 0 else 0
+#     eta_m, eta_s = divmod(eta_sec, 60)
+#     eta_h, eta_m = divmod(eta_m, 60)
+#     return dim(f"  [{eta_h}h{eta_m}m{eta_s:02}s left, {avg_time:.1f}s/audio]"), avg_time
 
 
 # ---------------------------------------------------------------------------
@@ -1204,7 +1409,6 @@ def _make_skip_result(result: dict, reason: str, t0: float, debug_lines: list | 
         result["debug_lines"] = debug_lines
     return result
 
-
 def _load_audio(p: Path) -> np.ndarray | None:
     """Load and mono-mix an audio file, returning a float32 array or None on failure."""
     try:
@@ -1213,17 +1417,52 @@ def _load_audio(p: Path) -> np.ndarray | None:
             stop = int(AUDIO_CLIP_S * sr_sf)
         else:
             sr_sf = stop = None
+        
+        # Read audio via SoundFile
         y_raw, sr_sf = sf.read(str(p), always_2d=False, dtype="float32", stop=stop)
+        
+        # Mix down to mono immediately in float32
         if y_raw.ndim > 1:
-            y_raw = y_raw.mean(axis=1)
-        return librosa.resample(y_raw, orig_sr=sr_sf, target_sr=SR) if sr_sf != SR else y_raw
+            y_raw = y_raw.mean(axis=1, dtype=np.float32)
+            
+        if sr_sf != SR:
+            y_resampled = librosa.resample(y_raw, orig_sr=sr_sf, target_sr=SR)
+            del y_raw
+            return np.asarray(y_resampled, dtype=np.float32)
+            
+        return np.asarray(y_raw, dtype=np.float32)
+        
     except Exception:
         try:
             y, _ = librosa.load(str(p), sr=SR, mono=True, duration=AUDIO_CLIP_S)
-            return y
+            return np.asarray(y, dtype=np.float32)
         except Exception:
             return None
         
+def _get_onset_envelopes(
+    audio_path: Path,
+    y_norm: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+
+    raw = librosa.onset.onset_strength(
+        y=y_norm,
+        sr=SR,
+        hop_length=HOP_LENGTH,
+    )
+
+    _, filtered = apply_lowpass(y_norm)
+
+    lowpass = librosa.onset.onset_strength(
+        y=filtered,
+        sr=SR,
+        hop_length=HOP_LENGTH,
+    )
+
+    result = (raw, lowpass)
+
+    del filtered
+
+    return result
 
 def _prepare_audio(
     p: Path,
@@ -1275,7 +1514,7 @@ def _refine_onset_frames(frames: np.ndarray, onset_env: np.ndarray) -> np.ndarra
     """Parabolic interpolation to get sub-frame onset positions.
     Fits a parabola through each detected frame and its two neighbours to find
     the true peak between frames, giving sub-hop-length timing precision cheaply."""
-    refined = frames.astype(np.float64)
+    refined = np.asarray(frames, dtype=np.float32).copy()
     for i, f in enumerate(frames):
         if 0 < f < len(onset_env) - 1:
             a, b, c = onset_env[f - 1], onset_env[f], onset_env[f + 1]
@@ -1392,6 +1631,182 @@ def _process_filter(
     return candidate, debug_lines
 
 
+def _score_grouped_delays(
+    onset_groups: list[np.ndarray],
+    chart_groups: list[np.ndarray],
+    delays: np.ndarray,
+    weight_fn,
+    debug: bool,
+) -> np.ndarray:
+    """Score one shared delay while keeping every stem paired with its chart part."""
+    scores = np.zeros(len(delays), dtype=float)
+    for audio_onsets_ms, chart_notes_ms in zip(onset_groups, chart_groups):
+        if len(audio_onsets_ms) and len(chart_notes_ms):
+            scores += _score_delays(
+                audio_onsets_ms,
+                chart_notes_ms,
+                delays,
+                weight_fn,
+                _boundary_mask(chart_notes_ms) if BOUNDARY_BONUS else None,
+                debug,
+            )
+    return scores
+
+
+def _estimate_grouped_delay_ms(
+    onset_groups: list[np.ndarray],
+    chart_groups: list[np.ndarray],
+    max_delay: int,
+    anchor_ms: int,
+    hard_score: bool,
+    debug: bool,
+    debug_lines: list[str],
+) -> tuple[int | None, float, float, int, bool]:
+    """Estimate one delay from paired stem/chart groups without cross-matching them."""
+    weight_fn = _hard_weight if hard_score else _soft_weight
+    center = anchor_ms
+    coarse_delays = np.arange(center - max_delay, center + max_delay + 1, COARSE_STEP)
+    coarse_scores = _score_grouped_delays(
+        onset_groups, chart_groups, coarse_delays, weight_fn, debug
+    )
+    best_idx = int(np.argmax(coarse_scores))
+    best_d = int(coarse_delays[best_idx])
+    best_s = float(coarse_scores[best_idx])
+
+    fine_delays = np.arange(best_d - COARSE_STEP, best_d + COARSE_STEP + FINE_STEP, FINE_STEP)
+    fine_scores = _score_grouped_delays(
+        onset_groups, chart_groups, fine_delays, weight_fn, debug
+    )
+    best_idx = int(np.argmax(fine_scores))
+    best_d = int(fine_delays[best_idx])
+    best_s = float(fine_scores[best_idx])
+
+    def score_at(_unused_chart, _unused_audio, delay: int, _debug: bool) -> float:
+        return float(_score_grouped_delays(
+            onset_groups,
+            chart_groups,
+            np.array([delay]),
+            weight_fn,
+            debug,
+        )[0])
+
+    best_d, best_s, extended, _, _ = _extend_search(
+        score_at,
+        np.array([]),
+        np.array([]),
+        center,
+        max_delay,
+        best_d,
+        best_s,
+        debug,
+        debug_lines,
+    )
+
+    min_needed = sum(
+        max(3.0, min(len(chart), len(audio)) / 2.0)
+        for audio, chart in zip(onset_groups, chart_groups)
+    ) * (TOLERANCE_MS / 20.0)
+    return (
+        (best_d if best_s >= min_needed else None),
+        best_s,
+        min_needed,
+        best_d,
+        extended,
+    )
+
+
+def _process_grouped_filter(
+    ini_path: Path,
+    onset_env_groups: list[np.ndarray],
+    chart_groups: list[np.ndarray],
+    cur_del: int,
+    max_delay: int,
+    clip_ms: float,
+    label: str,
+    hard_score: bool,
+    flip_sign: bool,
+    debug: bool,
+    debug_lines: list[str],
+) -> tuple[dict | None, list[str]]:
+    """Detect onsets per stem and score all stem/chart pairs with one shared delay."""
+    onset_groups: list[np.ndarray] = []
+    valid_chart_groups: list[np.ndarray] = []
+    for onset_env, chart_notes in zip(onset_env_groups, chart_groups):
+        delta_val = 0.05
+        frames = librosa.onset.onset_detect(
+            onset_envelope=onset_env, sr=SR, units="frames",
+            hop_length=HOP_LENGTH, pre_max=3, post_max=3,
+            pre_avg=10, post_avg=10, delta=delta_val, wait=5, backtrack=True,
+        )
+        onsets = librosa.frames_to_time(
+            _refine_onset_frames(frames, onset_env), sr=SR, hop_length=HOP_LENGTH
+        ) * 1000.0
+        while len(onsets) < 1.5 * clip_ms / 1000 and delta_val > 1e-3:
+            delta_val -= 0.005
+            frames = librosa.onset.onset_detect(
+                onset_envelope=onset_env, sr=SR, units="frames",
+                hop_length=HOP_LENGTH, pre_max=2, post_max=2,
+                pre_avg=5, post_avg=5, delta=delta_val, wait=3, backtrack=True,
+            )
+            candidate_onsets = librosa.frames_to_time(
+                _refine_onset_frames(frames, onset_env), sr=SR, hop_length=HOP_LENGTH
+            ) * 1000.0
+            if len(candidate_onsets) > len(onsets):
+                onsets = candidate_onsets
+        if len(onsets):
+            onset_groups.append(onsets)
+            valid_chart_groups.append(chart_notes)
+        elif debug:
+            debug_lines.append(
+                dim(f"        [debug] [all stems ({label})] no onsets detected "
+                    f"for paired chart group ({len(chart_notes)} notes)")
+            )
+
+    if not onset_groups:
+        debug_lines.append(dim(f"        [debug] [all stems ({label})] no usable paired onsets"))
+        return None, debug_lines
+
+    res, score, needed, best_d, ext = _estimate_grouped_delay_ms(
+        onset_groups, valid_chart_groups, max_delay, cur_del,
+        hard_score, debug, debug_lines,
+    )
+    computed_delay = best_d if not flip_sign else -best_d
+    total_notes = sum(len(chart) for chart in valid_chart_groups)
+    hard_count = sum(
+        compute_match_details(audio, chart, best_d)[0]
+        for audio, chart in zip(onset_groups, valid_chart_groups)
+    )
+    std_ratios = [compute_match_details(audio, chart, best_d)[2]
+                  for audio, chart in zip(onset_groups, valid_chart_groups)]
+    std_dev_ratio = float(np.mean(std_ratios)) if std_ratios else 0.0
+    debug_lines.append(dim(
+        f"        [debug] [all stems ({label})] {cur_del:+d} ms -> "
+        f"{computed_delay:+d} ms  [{score:.2f}/{needed:.2f}/"
+        f"{sum(len(audio) for audio in onset_groups)}/{total_notes} matched]"
+        f"  [{std_dev_ratio:.2f} std.dev ratio]"
+        f"{' extended' if ext else ''}"
+    ))
+    candidate = {
+        "res": res,
+        "delay": computed_delay,
+        "score": score,
+        "comparison": score / max(sum(len(audio) for audio in onset_groups), 1),
+        "hard_count": hard_count,
+        "needed": needed,
+        "ext": ext,
+        "std_dev_ratio": std_dev_ratio,
+        "audio_onsets_ms": onset_groups,
+        "nb_onsets": sum(len(audio) for audio in onset_groups),
+        "chart_notes_ms": valid_chart_groups,
+        "nb_chart_notes": total_notes,
+        "score_pct": score / total_notes if total_notes else 0,
+        "filter_label": label,
+        "audio_name": "all stems",
+        "grouped": True,
+    }
+    return candidate, debug_lines
+
+
 def _process_song(
     ini_path: Path,
     max_delay: int,
@@ -1400,6 +1815,7 @@ def _process_song(
     skip_inconclusive: bool,
     hard_score: bool = False,
     cancel_event: threading.Event | None = None,
+    existing_hash: dict = {}
 ) -> dict:
     result: dict = {
         "ini_path":       ini_path,
@@ -1420,24 +1836,32 @@ def _process_song(
     t0 = time.perf_counter()
     folder = ini_path.parent
 
-    cfg = read_ini(ini_path)
-    section, cur_del = get_delay_value(cfg)
-    had_delay_key = section is not None
-    if cur_del is None:
-        cur_del = 0
-    result["cur_del"] = cur_del
-    result["had_delay_key"] = had_delay_key
-
-    candidates = ExtractCONSNG.find_audio_candidates(folder)
+    mogg_candidates, hash_value_mogg = _mogg_candidates(folder, debug)
+    candidates = mogg_candidates if mogg_candidates else ExtractCONSNG.find_audio_candidates(folder)
     result["current_audios"] = len(candidates)
     if not candidates:
+        print('not candidates is true')
         return _make_skip_result(result, "no audio files found", t0)
+    if any(p is None for p in candidates):
+        print('any(p is None for p in candidates) is true')
+        return _make_skip_result(result, "one or more audio files could not be loaded", t0)
 
-    chart_parts, chart_reason = get_chart_notes(folder, debug)
+    chart_parts, chart_reason, hash_value = get_chart_notes(folder, debug)
     if not chart_parts:
         return _make_skip_result(result, chart_reason, t0)
     all_chart_notes = np.unique(np.concatenate(list(chart_parts.values())))
     result["chart_notes"] = all_chart_notes
+    result["hash"] = hash_value
+
+    cfg = read_ini(ini_path)
+    section, cur_del = get_delay_value(cfg)
+    had_delay_key = section is not None
+    if not had_delay_key or not cur_del:
+        cur_del = existing_hash.get(hash_value)
+    if cur_del is None:
+        cur_del = 0
+    result["cur_del"] = cur_del
+    result["had_delay_key"] = had_delay_key
 
     best_overall = None
     best_inconclusive = None
@@ -1446,17 +1870,35 @@ def _process_song(
     valid_audio_found = False
     result["candidates"] = []
 
+    raw_envelopes: list[np.ndarray] = []
+    lowpass_envelopes: list[np.ndarray] = []
+    chart_groups: list[np.ndarray] = []
+    max_clip_ms = 0.0
+    backing_only = all(
+        p.stem.lower() in {"backing", "song"}
+        for p in candidates
+    )
+
     for p in candidates:
         if cancel_event is not None and cancel_event.is_set():
             result["status"] = "cancelled"
             return _make_skip_result(result, "", t0)
 
-        stem_name = p.stem.lower()
-        chart_notes = midi_parts_for_stem(stem_name, chart_parts)
-        if chart_notes is None:
-            continue
-
         # Load and normalise audio
+        chart_notes = midi_parts_for_stem(p.stem.lower(), chart_parts)
+        if backing_only:
+            chart_notes = all_chart_notes
+        if len(chart_notes) == 0:
+            if debug:
+                debug_lines.append(
+                    f"        [debug] [{p.name}] no MIDI part mapping; "
+                    f"available parts: {', '.join(chart_parts)}"
+                )
+            continue
+        if debug:
+            debug_lines.append(
+                f"        [debug] [{p.name}] paired with {len(chart_notes)} MIDI notes"
+            )
         prepared = _prepare_audio(
             p,
             chart_notes,
@@ -1464,43 +1906,54 @@ def _process_song(
         )
         if prepared is None:
             continue
-        y_norm, chart_window, clip_ms = prepared
+        y_norm, _, clip_ms = prepared
         valid_audio_found = True
+        max_clip_ms = max(max_clip_ms, clip_ms)
+        chart_groups.append(prepared[1])
 
-        # Build onset envelopes: raw + lowpass + percussive (HPSS)
-        onset_envs = [librosa.onset.onset_strength(y=y_norm, sr=SR, hop_length=HOP_LENGTH)]
-        labels = ["no filter"]
-        filers_fns = [
-            apply_lowpass,
-            # apply_percussive
-        ]
-        for filter_fn in filers_fns:
-            name, filtered = filter_fn(y_norm)
-            onset_envs.append(librosa.onset.onset_strength(y=filtered, sr=SR, hop_length=HOP_LENGTH))
-            labels.append(name)
+        raw_env, lowpass_env = _get_onset_envelopes(p, y_norm)
 
-        for onset_env, label in zip(onset_envs, labels):
-            candidate, debug_lines = _process_filter(ini_path,
-                onset_env, chart_window, cur_del, max_delay, clip_ms,
-                p, label, hard_score, flip_sign, debug, debug_lines,
-            )
-            result["candidates"].append(candidate)
+        raw_envelopes.append(raw_env)
+        lowpass_envelopes.append(lowpass_env)
 
-            if candidate is None:
-                continue
+    if hash_value_mogg:
+        mogg_extract_path = CACHE_PATH / hash_value_mogg
+        if mogg_extract_path.is_dir():
+            try:
+                [x.unlink() for x in mogg_extract_path.glob('*') if x.is_file()]
+                dprint(debug, f'Emptied directory {mogg_extract_path}.')
+            except:
+                dprint(debug, f'Could not empty directory {mogg_extract_path}.')
+            shutil.rmtree(mogg_extract_path)
 
-            res = candidate.pop("res")
-            if res is not None:
-                if best_overall is None or candidate["score"] > best_overall["score"]:
-                    best_overall = {**candidate, "inconclusive": False}
-            else:
-                inconclusive_delays.append(candidate["delay"])
-                if candidate["score"] >= candidate["needed"] * 0.5:
-                    if best_inconclusive is None or candidate["score"] > best_inconclusive["score"]:
-                        best_inconclusive = {**candidate, "inconclusive": True}
 
     if not valid_audio_found:
-        return _make_skip_result(result, "no audio file (or all stems are silent)", t0, debug_lines)
+        return _make_skip_result(result, "no audio file (or all stems are silent), need logic to check mogg", t0, debug_lines)
+
+    aggregate_inputs = [
+        (raw_envelopes, "no filter"),
+        (lowpass_envelopes, "lowpass"),
+    ]
+    for onset_env_groups, label in aggregate_inputs:
+        candidate, debug_lines = _process_grouped_filter(
+            ini_path, onset_env_groups, chart_groups, cur_del, max_delay,
+            max_clip_ms, label, hard_score, flip_sign,
+            debug, debug_lines,
+        )
+        result["candidates"].append(candidate)
+
+        if candidate is None:
+            continue
+
+        res = candidate.pop("res")
+        if res is not None:
+            if best_overall is None or candidate["score"] > best_overall["score"]:
+                best_overall = {**candidate, "inconclusive": False}
+        else:
+            inconclusive_delays.append(candidate["delay"])
+            if candidate["score"] >= candidate["needed"] * 0.5:
+                if best_inconclusive is None or candidate["score"] > best_inconclusive["score"]:
+                    best_inconclusive = {**candidate, "inconclusive": True}
 
     tight_values_cluster = bool(inconclusive_delays and (max(inconclusive_delays) - min(inconclusive_delays)) <= 30)
 
@@ -1532,6 +1985,10 @@ def _process_song(
     result["debug_lines"] = debug_lines
     result["elapsed"] = time.perf_counter() - t0
     result["nb_onsets"] = best_overall['nb_onsets']
+
+    del raw_envelopes, lowpass_envelopes
+    gc.collect()
+
     return result
 
 
@@ -1583,6 +2040,7 @@ def process_library(
     tag = dim("[dry-run] ") if dry_run else ""
 
     existing = load_list()
+    existing_hash = load_hash_list()
 
     print("Scanning songs...")
     # First scan — full, for display only
@@ -1591,7 +2049,6 @@ def process_library(
     )
     if not all_songs:
         print("No songs found.")
-        save_list(existing)
         return
 
     print(bold(f"Scanning {len(all_songs)} songs"))
@@ -1624,7 +2081,7 @@ def process_library(
 
     # Replace CON/SNG paths with their extracted ini paths
     songs = [
-        extracted_map.get(p) if p in extracted_map else p for p in songs
+        extracted_map[p] if p in extracted_map else p for p in songs
         if not (ExtractCONSNG.is_con_file(p) or ExtractCONSNG.is_sng_file(p)) or p in extracted_map
     ]
 
@@ -1633,7 +2090,7 @@ def process_library(
     print("\n")
 
     updated = skipped = extended_count = inconclusive_count = clustered_count = 0
-    avg_time = -1.0
+    eta = ETATracker(total_audios)
     counter_audios = 0
     name_width = MAX_SONG_NAME
     start_time = time.perf_counter()
@@ -1658,11 +2115,12 @@ def process_library(
         # for song in songs:
         #     print(f'"{song_key(song)}": None,')
         for ini_path in songs:
-            fut = executor.submit(
-                _process_song, ini_path, max_delay, debug, flip_sign,
-                skip_inconclusive, hard_score, cancel_event,
-            )
-            futures.append((ini_path, fut))
+            if ini_path:
+                fut = executor.submit(
+                    _process_song, ini_path, max_delay, debug, flip_sign,
+                    skip_inconclusive, hard_score, cancel_event, existing_hash
+                )
+                futures.append((ini_path, fut))
 
         print('Starting calibration...                         [score/needed/nb_onsets/nb_notes matched, %(needed), %(onsets), %(notes)]')
         for i, (ini_path, fut) in enumerate(futures):
@@ -1677,6 +2135,7 @@ def process_library(
             display = folder.name[:name_width - 3] + "..." if len(folder.name) > name_width else folder.name
             padded = f"{display:<{name_width}}"
 
+            hash_value = r.get('hash')
             cur_del = r["cur_del"]
             had_delay_key = r["had_delay_key"]
             chart_notes = r["chart_notes"]
@@ -1688,9 +2147,7 @@ def process_library(
             if r["status"] in ("skip", "cancelled"):
                 if r["status"] == "cancelled":
                     continue
-                eta_str, avg_time = compute_eta(start_time, avg_time, total_audios, counter_audios,
-                                                current_audios, debug, sample_elapsed=r["elapsed"], workers=workers)
-                print(f"{red('skip')}  {padded}  {dim(r['skip_reason'])}{eta_str} (done {i+1}/{len(songs)})")
+                eta_str = dim(eta.update(counter_audios))
                 if not keep_skipped and not dry_run:
                     remove_from_list(existing, song_key(ini_path), debug)
                 skipped += 1
@@ -1728,8 +2185,7 @@ def process_library(
             else:
                 ok_label = green("ok  ")
 
-            eta_str, avg_time = compute_eta(start_time, avg_time, total_audios, counter_audios,
-                                            current_audios, debug, sample_elapsed=r["elapsed"], workers=workers)
+            eta_str = dim(eta.update(counter_audios))
             best_delay = best["delay"]
             print(
                 f"{ok_label}  {padded}  {dim(f'{cur_del:+d} ms -> ')}{bold(f'{best_delay:+d} ms')}"
@@ -1792,29 +2248,18 @@ def process_library(
                 compare_results = []
 
                 for candidate in r["candidates"]:
-                    explain_best = _explain_score(
-                        candidate["audio_onsets_ms"],
-                        candidate["chart_notes_ms"],
-                        candidate["delay"],
-                        hard_score,
+                    explain_best = _explain_candidate_score(
+                        candidate, candidate["delay"], hard_score
                     )
 
-                    known_candidate = _explain_score(
-                        candidate["audio_onsets_ms"],
-                        candidate["chart_notes_ms"],
-                        known_delay,
-                        hard_score,
+                    known_candidate = _explain_candidate_score(
+                        candidate, known_delay, hard_score
                     )
 
                     best_known_delay = known_delay
 
                     for d in range(known_delay - 2, known_delay + 3):
-                        c = _explain_score(
-                            candidate["audio_onsets_ms"],
-                            candidate["chart_notes_ms"],
-                            d,
-                            hard_score,
-                        )
+                        c = _explain_candidate_score(candidate, d, hard_score)
 
                         if c["score"] > known_candidate["score"]:
                             known_candidate = c
@@ -1837,7 +2282,7 @@ def process_library(
 
                 for _, candidate, explain_best, best_known_delay, known_candidate in compare_results:
                     comparison_name = f"{candidate['audio_name']} ({candidate['filter_label']})"
-                    winner_name = f"{r.get("best_overall").get("audio_name")} ({r.get("best_overall").get("filter_label")})"
+                    winner_name = f'{r.get("best_overall").get("audio_name")} ({r.get("best_overall").get("filter_label")})'
                     compare_line = f"        [compare] {comparison_name}"
                     print_green = False
                     if comparison_name == winner_name:
@@ -1877,11 +2322,29 @@ def process_library(
 
             if not dry_run:
                 total_pct = round(10000 * (best['score'] / len(chart_notes) if len(chart_notes) > 0 else 0)) / 10000
-                write_delay(ini_path, best['delay'], had_delay_key)
+                if USE_INI or hash_value is None:
+                    write_delay(ini_path, best['delay'], had_delay_key)
+                else:
+                    try:
+                        write_delay_hash(hash_value, existing_hash, delay=best['delay'])
+                        try:
+                            write_delay(ini_path, 0, had_delay_key)
+                        except Exception as e:
+                            print(f"{e}: couldn't zero ini for {ini_path}, rolling back hash entry.")
+                            try:
+                                remove_delay_hash(hash_value, existing_hash)
+                            except Exception as e2:
+                                print(f"{e2}: rollback failed too — {ini_path} may have the delay in both places.")
+                            write_delay(ini_path, best['delay'], had_delay_key)
+                    except Exception as e:
+                        print(f"{e}: wasn't able to write delay to hash file for {ini_path}.")
+                        write_delay(ini_path, best['delay'], had_delay_key)
                 remove_from_list(existing, song_key(ini_path), debug, always_print=False)
                 add_to_list(existing, save_key, best['delay'], total_pct)
                 if updated > 0 and i % 50 == 0:
                     save_list(existing)
+                    if not USE_INI:
+                        json.dump(existing_hash, open(MODIF_PATH, "w"), indent=2)
 
     except KeyboardInterrupt:
         print("\n[!] Shutdown signal received.")
@@ -1892,6 +2355,7 @@ def process_library(
 
     print("Saving results...")
     save_list(existing)
+    json.dump(existing_hash, open(MODIF_PATH, "w"), indent=2)
     print(count_results)
 
     total_time = time.perf_counter() - start_time
@@ -1944,9 +2408,9 @@ def main() -> None:
     parser.add_argument("--overwrite",               action="store_true", help="Overwrite existing folder during CON and SNG extraction.")
     parser.add_argument("--skip-extracted",          action="store_true", help="Skip all song folders that were extracted from CON or SNG files.")
     parser.add_argument("--dump-raw",                action="store_true", help="Dump all the raw files found in CON or SNG packages.")
-    parser.add_argument("--shutdown-after",          action="store_true", help="Shutdown system after calibration, useful to run while sleeping.")
+    parser.add_argument("--shutdown-after",          action="store_true", help="Shutdown system after calibration, useful to start and go to sleep irl.")
     parser.add_argument("--hard-score",              action="store_true", help="Use hard scoring (binary match within tolerance) instead of soft scoring.")
-    parser.add_argument("--tolerance",               type=int, default=None, help=f"Onset match window in ms (default: {TOLERANCE_MS}). Try 15 for sharper discrimination.")
+    parser.add_argument("--tolerance",               type=int, default=None, help=f"Onset match window in ms (default: {TOLERANCE_MS}). Try 10 for sharper discrimination.")
     parser.add_argument("--hop-length",              type=int, default=None, help=f"librosa hop length for onset detection (default: {HOP_LENGTH}). Use 256 for finer time resolution at ~2x CPU cost.")
     parser.add_argument("--boundary-bonus",          action="store_true", help="Add extra score weight to first/last 5%% of chart notes to help discriminate one-measure-off errors.")
     parser.add_argument("--streak-bonus", action="store_true", help="Reward consecutive runs of matched onsets.")
@@ -1994,6 +2458,9 @@ def main() -> None:
     except KeyboardInterrupt:
         interrupted = True
 
+    if CACHE_PATH.exists():
+        shutil.rmtree(CACHE_PATH)
+
     if args.shutdown_after and not interrupted:
         if log_file is not None:
             sys.stdout = sys.__stdout__
@@ -2007,4 +2474,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    import cProfile
+    import pstats
+
+    with cProfile.Profile() as pr:
+        main()
+
+    pstats.Stats(pr).sort_stats("cumtime").print_stats(50)

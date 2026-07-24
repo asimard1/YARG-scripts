@@ -791,6 +791,7 @@ def _split_mogg(
     song_info: dict | None,
     quality: int = 6,
     cancel_event: threading.Event | None = None,
+    output_format: str = "ogg",
 ) -> None:
 
     if shutil.which("ffmpeg") is None:
@@ -955,6 +956,12 @@ def _split_mogg(
         )
 
     output_args = []
+    if output_format == "wav":
+        output_codec = ["-c:a", "pcm_s16le"]
+        output_suffix = ".wav"
+    else:
+        output_codec = ["-c:a", "libvorbis", "-q:a", str(quality)]
+        output_suffix = ".ogg"
 
     # Build stems from DTA
     # Build stems from DTA
@@ -970,22 +977,20 @@ def _split_mogg(
                 stem_num = (sub_idx // 2) + 1
                 label = f"stem{idx}_{stem_num}"
                 filter_parts.append(_pan(sub_ch, label))
-                out_path = dest_dir / f"{name}_{stem_num}.ogg"
+                out_path = dest_dir / f"{name}_{stem_num}{output_suffix}"
                 output_args += [
                     "-map", f"[{label}]",
-                    "-c:a", "libvorbis",
-                    "-q:a", str(quality),
+                    *output_codec,
                     str(out_path),
                 ]
         else:
             # Standard mono/stereo tracks remain single files
             label = f"stem{idx}"
             filter_parts.append(_pan(channels, label))
-            out_path = dest_dir / f"{name}.ogg"
+            out_path = dest_dir / f"{name}{output_suffix}"
             output_args += [
                 "-map", f"[{label}]",
-                "-c:a", "libvorbis",
-                "-q:a", str(quality),
+                *output_codec,
                 str(out_path),
             ]
 
@@ -994,11 +999,10 @@ def _split_mogg(
         label = "stem_backing"
         filter_parts.append(_pan(stem_channels_extra, label))
 
-        out_path = dest_dir / "song.ogg"
+        out_path = dest_dir / f"song{output_suffix}"
         output_args += [
             "-map", f"[{label}]",
-            "-c:a", "libvorbis",
-            "-q:a", str(quality),
+            *output_codec,
             str(out_path),
         ]
 
@@ -1093,7 +1097,7 @@ def _has_audio(folder: Path) -> bool:
 
 
 def find_audio_candidates(folder: Path, calibration=True) -> list[Path]:
-    """Return audio files sorted by stem priority then alphabetically."""
+    """Return supported audio files, preferring instrument stems for calibration."""
 
     candidates = [
         p for p in folder.rglob("*")
@@ -1104,8 +1108,13 @@ def find_audio_candidates(folder: Path, calibration=True) -> list[Path]:
         candidates = [
             p for p in candidates
             if p.stem.lower() not in STEM_IGNORE
-            and p.stem.lower() in STEM_CANDIDATES
         ]
+        stem_candidates = [
+            p for p in candidates
+            if p.stem.lower() not in {"backing", "song"}
+        ]
+        if stem_candidates:
+            candidates = stem_candidates
     if len(candidates) == 0:
         dprint(True, "No audio candidates were found. Fallback to song audio.")
         to_add = [
