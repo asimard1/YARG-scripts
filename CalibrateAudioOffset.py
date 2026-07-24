@@ -77,7 +77,7 @@ except ImportError as e:
 # --- Constants ---
 
 # Delay search
-MAX_DELAY_MS = 200     # initial search range (ms)
+MAX_DELAY_MS = 100     # initial search range (ms)
 COARSE_STEP = 3        # coarse scan spacing before fine refinement
 FINE_STEP = 1          # fine scan spacing
 EXTEND_LIMIT = 5       # can extend to ±(EXTEND_LIMIT × MAX_DELAY_MS)
@@ -101,12 +101,13 @@ if os.name == 'nt':
     APPDATA_ROAMING = Path(os.environ["APPDATA"])
     MODIF_PATH = APPDATA_ROAMING.parent / 'LocalLow' / 'YARC' / 'YARG' / 'nightly' / 'song_offsets.json'
     print('Json file for offsets exists:', MODIF_PATH.is_file())
-    if MODIF_PATH.is_file():
-        USE_INI = False
+    # if MODIF_PATH.is_file():
+    #     USE_INI = False
+    print("[Warning] Forced USE_INI to True for now, because I prefer to have the offset values portable.")
 else:
     MODIF_PATH = None
     print("You are running a non-Windows OS.")
-print(f'Path for values: {MODIF_PATH}, Use ini files: {USE_INI}.')
+print(f'Path for values: {MODIF_PATH}, use ini files: {USE_INI}.')
 LIST_PATH = Path(__file__).parent / "yarg_sync_list.json"
 WORKER_THREADS = 6
 ETA_EMA_ALPHA = 0.1
@@ -2324,6 +2325,8 @@ def process_library(
                 total_pct = round(10000 * (best['score'] / len(chart_notes) if len(chart_notes) > 0 else 0)) / 10000
                 if USE_INI or hash_value is None:
                     write_delay(ini_path, best['delay'], had_delay_key)
+                    if not hash_value is None:
+                        remove_delay_hash(hash_value, existing_hash)
                 else:
                     try:
                         write_delay_hash(hash_value, existing_hash, delay=best['delay'])
@@ -2343,8 +2346,7 @@ def process_library(
                 add_to_list(existing, save_key, best['delay'], total_pct)
                 if updated > 0 and i % 50 == 0:
                     save_list(existing)
-                    if not USE_INI:
-                        json.dump(existing_hash, open(MODIF_PATH, "w"), indent=2)
+                    json.dump(existing_hash, open(MODIF_PATH, "w"), indent=2)
 
     except KeyboardInterrupt:
         print("\n[!] Shutdown signal received.")
